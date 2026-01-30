@@ -1,0 +1,23 @@
+# Web framework & transport
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+websockets>=12.0
+
+# Audio / VAD
+numpy>=1.24.0
+webrtcvad>=2.0.10
+# Optional recording: PCM → MP3 (requires ffmpeg on system)
+pydub>=0.25.0
+# Optional: silero-vad (uncomment if preferred over webrtcvad)
+# torch>=2.0.0
+# torchaudio>=2.0.0
+
+# ASR - local (choose one or both)
+# faster-whisper>=1.0.0
+# openai-whisper  # alternative
+
+# HTTP client for remote ASR
+httpx>=0.26.0
+
+# Config
+pydantic-settings>=2.1.0
