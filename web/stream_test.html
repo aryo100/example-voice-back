@@ -1,0 +1,546 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Real-time Audio Streaming Test Client</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; max-width: 960px; margin: 24px auto; padding: 0 16px; }
+    h1 { font-size: 1.25rem; margin-bottom: 8px; }
+    label { display: block; margin-top: 12px; margin-bottom: 4px; font-weight: 500; }
+    input[type="text"] { width: 100%; padding: 8px; font-family: monospace; }
+    button { padding: 10px 20px; font-size: 1rem; cursor: pointer; margin-top: 12px; }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .status { font-size: 0.85rem; color: #64748b; margin-top: 8px; }
+    .error { color: #dc2626; }
+    .split-row { display: flex; gap: 20px; margin-top: 20px; align-items: stretch; }
+    @media (max-width: 640px) { .split-row { flex-direction: column; } }
+    .split-left { flex: 1; min-width: 0; border-right: 1px solid #e2e8f0; padding-right: 20px; }
+    .split-right { flex: 1; min-width: 0; }
+    @media (max-width: 640px) { .split-left { border-right: none; padding-right: 0; padding-bottom: 16px; border-bottom: 1px solid #e2e8f0; } }
+    .live { background: #f0f9ff; border: 1px solid #0ea5e9; border-radius: 6px; padding: 12px; min-height: 48px; margin-top: 8px; }
+    .history { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; padding: 12px; min-height: 160px; max-height: 320px; overflow-y: auto; margin-top: 8px; white-space: pre-wrap; font-size: 0.9rem; }
+    .chat-section { display: flex; flex-direction: column; min-height: 280px; }
+    .chat-messages { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px; min-height: 160px; max-height: 320px; overflow-y: auto; margin-bottom: 8px; font-size: 0.9rem; flex: 1; }
+    .chat-msg { margin-bottom: 10px; }
+    .chat-msg.user { text-align: right; }
+    .chat-msg.user .bubble { display: inline-block; max-width: 85%; background: #0ea5e9; color: #fff; padding: 8px 12px; border-radius: 12px 12px 4px 12px; text-align: left; }
+    .chat-msg.assistant .bubble { display: inline-block; max-width: 85%; background: #e2e8f0; color: #1e293b; padding: 8px 12px; border-radius: 12px 12px 12px 4px; }
+    .chat-msg .meta { font-size: 0.75rem; color: #64748b; margin-top: 2px; }
+    .chat-input-row { display: flex; gap: 8px; margin-top: 8px; }
+    .chat-input-row input { flex: 1; padding: 8px 12px; border: 1px solid #e2e8f0; border-radius: 8px; }
+    .chat-input-row button { padding: 8px 16px; }
+    .segment-raw { margin-bottom: 2px; }
+    .chat-indicator { font-size: 0.85rem; color: #64748b; margin-top: 6px; margin-bottom: 6px; }
+    .chat-indicator.loading { color: #0ea5e9; }
+    .session-indicator { font-size: 0.8rem; color: #64748b; margin-bottom: 8px; min-height: 1.2em; }
+    .session-indicator.active { color: #0ea5e9; font-weight: 500; }
+  </style>
+</head>
+<body>
+  <h1>Real-time Audio Streaming Test Client</h1>
+  <p style="font-size: 0.9rem; color: #64748b;">Microphone → PCM → WebSocket → transcript. Chat via /api/chat. <strong>Hindari CORS:</strong> jalankan <code>python server.py</code> di folder ini, lalu buka <code>http://localhost:8080/stream_test.html</code>.</p>
+
+  <label for="wsUrl">WebSocket URL</label>
+  <input type="text" id="wsUrl" value="ws://localhost:8000/ws/transcribe" placeholder="ws://localhost:8000/ws/transcribe" />
+
+  <button id="btnStart">Start recording</button>
+  <button id="btnStop" disabled>Stop recording</button>
+  <a id="btnDownload" href="#" download style="display: none; padding: 10px 20px; font-size: 1rem; cursor: pointer; margin-top: 12px; background: #0ea5e9; color: #fff; border: none; border-radius: 6px; text-decoration: none;">Download recording</a>
+
+  <div id="status" class="status">Ready. Set URL and click Start.</div>
+
+  <div class="split-row">
+    <div class="split-left">
+      <label>Live transcript (partial)</label>
+      <div id="live" class="live"><em>—</em></div>
+      <label>Final transcript history <span style="font-weight: normal; color: #64748b;">(raw STT, disimpan saat stop)</span></label>
+      <div id="history" class="history"></div>
+    </div>
+    <div class="split-right">
+      <section class="chat-section" aria-label="Chat with AI">
+        <label>Chat</label>
+        <p style="font-size: 0.85rem; color: #64748b;">Percakapan dua arah. Chat memakai session dari transcript.</p>
+        <div id="sessionIndicator" class="session-indicator" aria-live="polite"></div>
+        <div id="chatMessages" class="chat-messages"></div>
+        <div id="chatIndicator" class="chat-indicator" style="display: none;"></div>
+        <div class="chat-input-row">
+          <input type="text" id="chatInput" placeholder="Tulis pesan…" />
+          <button type="button" id="btnChatSend">Kirim</button>
+          <button type="button" id="btnNewChat" title="Kosongkan tampilan chat">New Chat</button>
+          <button type="button" id="btnNewSession" title="Mulai session baru (perlu recording lagi untuk session_id)">New Session</button>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <script>
+    (function () {
+      "use strict";
+
+      // ========== CONFIG ==========
+      const ENABLE_FRONTEND_RECORDING = true;
+      const RECORD_FORMAT = "webm";
+      const FILE_PREFIX = "session_recording";
+      const PCM_GAIN = 3.0;  // Amplify PCM for backend (2–4×). Clamp in worklet to avoid clipping.
+      const DEBUG_AUDIO = false;  // Set true to log RMS, silent buffers, MediaRecorder start/stop.
+
+      // ========== STREAMING vs SAVED AUDIO (two separate paths) ==========
+      // - STREAMING: AudioWorklet captures mic → resample 16kHz mono → PCM 16-bit (with gain) → WebSocket only.
+      //   AudioWorkletNode is NOT connected to audioContext.destination — we do NOT play mic to speaker
+      //   (that would cause echo/feedback and is only for capture). Backend gets PCM for ASR.
+      // - SAVED: MediaRecorder records the same MediaStream to file. MediaRecorder is ONLY for download;
+      //   we do NOT send its output to the backend. No double-encode; no routing through AudioContext.
+
+      // ========== AUDIO PIPELINE (streaming) ==========
+      // 1. getUserMedia → MediaStream (mic at device sample rate, e.g. 48kHz)
+      // 2. AudioContext + MediaStreamSource → AudioWorkletNode (not deprecated)
+      // 3. Worklet processor: Float32 at context rate → resample 16kHz → PCM 16-bit → postMessage
+      // 4. Main thread: receive PCM frames via port.onmessage → send over WebSocket
+      // 5. Frame size ~20ms (320 samples = 640 bytes)
+
+      const TARGET_SAMPLE_RATE = 16000;
+      const FRAME_MS = 20;
+      const FRAME_SAMPLES = (TARGET_SAMPLE_RATE * FRAME_MS) / 1000; // 320
+
+      // AudioWorklet processor: resample + gain + PCM 16-bit. Output is ONLY sent via postMessage (WebSocket).
+      // GAIN applied here so backend receives audible level; clamp [-1,1] to prevent clipping.
+      const WORKLET_CODE = `
+        const TARGET = 16000;
+        const FRAME = 320;
+        const GAIN = ${PCM_GAIN};
+        let inputRate = 48000;
+        let float32Buf = [];
+        let resampledBuf = [];
+
+        function resampleTo16k(input, rate) {
+          if (rate === TARGET) return Array.from(input);
+          const ratio = rate / TARGET;
+          const outLen = Math.round(input.length / ratio);
+          const out = [];
+          for (let i = 0; i < outLen; i++) {
+            const srcIdx = i * ratio;
+            const j = Math.floor(srcIdx);
+            const f = srcIdx - j;
+            const a = input[j] ?? 0;
+            const b = input[j + 1] ?? a;
+            out.push(a + f * (b - a));
+          }
+          return out;
+        }
+        function toPcm16(arr) {
+          const pcm = new Int16Array(arr.length);
+          for (let i = 0; i < arr.length; i++) {
+            const s = Math.max(-1, Math.min(1, arr[i] * GAIN));
+            pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+          }
+          return pcm.buffer;
+        }
+
+        class PcmSenderProcessor extends AudioWorkletProcessor {
+          constructor(options) {
+            super();
+            if (options.processorOptions && options.processorOptions.sampleRate)
+              inputRate = options.processorOptions.sampleRate;
+          }
+          process(inputs, outputs, parameters) {
+            const input = inputs[0];
+            if (!input || !input.length) return true;
+            const ch0 = input[0];
+            if (!ch0 || ch0.length === 0) return true;
+            for (let i = 0; i < ch0.length; i++) float32Buf.push(ch0[i]);
+            const needInput = Math.ceil(FRAME * (inputRate / TARGET));
+            if (float32Buf.length < needInput) return true;
+            const chunk = float32Buf.splice(0, needInput);
+            const resampled = resampleTo16k(new Float32Array(chunk), inputRate);
+            for (let i = 0; i < resampled.length; i++) resampledBuf.push(resampled[i]);
+            while (resampledBuf.length >= FRAME) {
+              const frame = resampledBuf.splice(0, FRAME);
+              const buf = toPcm16(frame);
+              this.port.postMessage(buf, [buf]);
+            }
+            return true;
+          }
+        }
+        registerProcessor("pcm-sender", PcmSenderProcessor);
+      `;
+
+      let audioContext = null;
+      let sourceNode = null;
+      let workletNode = null;
+      let stream = null;
+      let ws = null;
+      let isRecording = false;
+
+      // Frontend recording (optional): MediaRecorder writes encoded audio to chunks; one session = one file.
+      let mediaRecorder = null;
+      let recordedChunks = [];
+      let lastRecordingUrl = null;
+
+      const $ = (id) => document.getElementById(id);
+      const liveEl = $("live");
+      const historyEl = $("history");
+      const statusEl = $("status");
+      const btnStart = $("btnStart");
+      const btnStop = $("btnStop");
+      const btnDownload = $("btnDownload");
+      const wsUrlInput = $("wsUrl");
+      const chatMessagesEl = $("chatMessages");
+      const chatInputEl = $("chatInput");
+      const btnChatSend = $("btnChatSend");
+      const btnNewChat = $("btnNewChat");
+      const btnNewSession = $("btnNewSession");
+      const chatIndicatorEl = $("chatIndicator");
+      const sessionIndicatorEl = $("sessionIndicator");
+
+      // Transcript: kumpulan segment saat recording (untuk tampilan). Saat stop → snapshot ke rawTranscript.
+      let transcriptSegments = [];
+      let rawTranscript = "";
+      let hasTranscript = false;
+      // session_id HANYA dari WebSocket transcript (type "session" atau partial/final dengan session_id). Frontend TIDAK generate.
+      let currentSessionId = null;
+      let hasEverReceivedSession = false;  // true setelah pernah dapat session_id dari WS; tidak di-reset saat stop recording
+
+      // MediaRecorder MIME fallback: audio/webm → audio/ogg. (audio/wav not supported by MediaRecorder.)
+      function getRecordMimeType() {
+        const types = ["audio/webm", "audio/webm;codecs=opus", "audio/ogg", "audio/mp4"];
+        for (const t of types) {
+          if (typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(t)) return t;
+        }
+        return "";
+      }
+
+      function getRecordFileExtension() {
+        const mime = getRecordMimeType();
+        if (mime.indexOf("webm") !== -1) return "webm";
+        if (mime.indexOf("mp4") !== -1) return "mp4";
+        return "webm";
+      }
+
+      function setStatus(msg, isError) {
+        statusEl.textContent = msg;
+        statusEl.className = "status" + (isError ? " error" : "");
+      }
+
+      // Tampilkan history transcript (raw saja; tidak interpretasi/refine di frontend).
+      function renderTranscriptHistory() {
+        if (!historyEl) return;
+        historyEl.innerHTML = "";
+        transcriptSegments.forEach((seg) => {
+          const raw = typeof seg === "string" ? seg : seg.raw;
+          if (!raw) return;
+          const rawDiv = document.createElement("div");
+          rawDiv.className = "segment-raw";
+          rawDiv.textContent = raw;
+          historyEl.appendChild(rawDiv);
+        });
+      }
+
+      // Base URL untuk API. Jika halaman diload dari http(s) (bukan file://), pakai origin saat ini
+      // supaya request lewat dev-server proxy dan tidak kena CORS. Kalau file://, pakai host dari WebSocket URL.
+      function getApiBaseUrl() {
+        if (typeof location !== "undefined" && location.origin && location.origin !== "null")
+          return location.origin;
+        const url = (wsUrlInput && wsUrlInput.value || "").trim();
+        if (!url) return "";
+        try {
+          const u = new URL(url);
+          const proto = u.protocol === "wss:" ? "https:" : "http:";
+          return proto + "//" + u.host;
+        } catch (_) {
+          return "";
+        }
+      }
+
+      function setChatIndicator(text, loading) {
+        if (!chatIndicatorEl) return;
+        if (!text) {
+          chatIndicatorEl.style.display = "none";
+          chatIndicatorEl.textContent = "";
+          chatIndicatorEl.classList.remove("loading");
+          return;
+        }
+        chatIndicatorEl.textContent = text;
+        chatIndicatorEl.style.display = "block";
+        chatIndicatorEl.classList.toggle("loading", !!loading);
+      }
+
+      // Tampilkan status session: hanya update jika payload WS punya session_id; tidak generate di frontend.
+      function updateSessionIndicator() {
+        if (!sessionIndicatorEl) return;
+        if (currentSessionId) {
+          const short = currentSessionId.length > 12 ? currentSessionId.slice(0, 12) + "…" : currentSessionId;
+          sessionIndicatorEl.textContent = "Session active: " + short;
+          sessionIndicatorEl.className = "session-indicator active";
+          sessionIndicatorEl.title = "Context locked • " + currentSessionId;
+        } else {
+          sessionIndicatorEl.textContent = "";
+          sessionIndicatorEl.className = "session-indicator";
+          sessionIndicatorEl.title = "";
+        }
+      }
+
+      function startRecording() {
+        const url = wsUrlInput.value.trim();
+        if (!url) {
+          setStatus("Please enter WebSocket URL.", true);
+          return;
+        }
+
+        setStatus("Requesting microphone…");
+        const audioConstraints = {
+          audio: {
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false
+          },
+          video: false
+        };
+        navigator.mediaDevices
+          .getUserMedia(audioConstraints)
+          .then((mediaStream) => {
+            stream = mediaStream;
+            setStatus("Connecting WebSocket…");
+            ws = new WebSocket(url);
+            ws.binaryType = "arraybuffer";
+
+            ws.onopen = () => {
+              setStatus("Connected. Starting audio capture (AudioWorklet)…");
+              audioContext = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: "interactive" });
+              const inputSampleRate = audioContext.sampleRate;
+              sourceNode = audioContext.createMediaStreamSource(stream);
+              // Data URL avoids "Not allowed to load local resource: blob:null/..." when opening file via file://
+              const workletUrl = "data:application/javascript;base64," + btoa(unescape(encodeURIComponent(WORKLET_CODE)));
+              audioContext.audioWorklet.addModule(workletUrl).then(() => {
+                workletNode = new AudioWorkletNode(audioContext, "pcm-sender", {
+                  processorOptions: { sampleRate: inputSampleRate },
+                  numberOfInputs: 1,
+                  numberOfOutputs: 1
+                });
+                workletNode.port.onmessage = (e) => {
+                  if (ws && ws.readyState === WebSocket.OPEN && e.data) ws.send(e.data);
+                };
+                sourceNode.connect(workletNode);
+                // Do NOT connect workletNode to audioContext.destination — worklet is for CAPTURE only.
+                // Playing mic to speaker would cause echo/feedback and is not needed for streaming.
+                isRecording = true;
+                btnStart.disabled = true;
+                btnStop.disabled = false;
+                transcriptSegments = [];
+                renderTranscriptHistory();
+
+                if (ENABLE_FRONTEND_RECORDING && typeof MediaRecorder !== "undefined") {
+                  recordedChunks = [];
+                  const mime = getRecordMimeType();
+                  try {
+                    mediaRecorder = new MediaRecorder(stream, mime ? { mimeType: mime } : {});
+                    mediaRecorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) recordedChunks.push(e.data); };
+                    mediaRecorder.start(1000);
+                    if (DEBUG_AUDIO) console.log("[MediaRecorder] started", mime || "default");
+                  } catch (err) {
+                    mediaRecorder = new MediaRecorder(stream);
+                    mediaRecorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) recordedChunks.push(e.data); };
+                    mediaRecorder.start(1000);
+                    if (DEBUG_AUDIO) console.log("[MediaRecorder] started (fallback)");
+                  }
+                }
+
+                setStatus("Recording. Speaking will stream to backend." + (ENABLE_FRONTEND_RECORDING ? " (Saving to file.)" : ""));
+              }).catch((err) => {
+                setStatus("AudioWorklet failed: " + (err.message || "addModule error"), true);
+              });
+            };
+
+            ws.onmessage = (event) => {
+              if (typeof event.data !== "string") return;
+              let obj;
+              try {
+                obj = JSON.parse(event.data);
+                console.log("[WS DATA] ", obj);
+              } catch (_) {
+                return;
+              }
+              // session_id HANYA dari backend. Simpan pertama kali saja; tidak bergantung pada WS aktif.
+              if (obj.session_id != null && !hasEverReceivedSession) {
+                currentSessionId = obj.session_id;
+                hasEverReceivedSession = true;
+                updateSessionIndicator();
+              }
+              if (obj.type === "session") {
+                // Hanya session_id sudah disimpan di atas; tidak perlu aksi lain.
+              } else if (obj.type === "partial") {
+                liveEl.textContent = obj.text || "";
+                if (!liveEl.textContent) liveEl.innerHTML = "<em>—</em>";
+              } else if (obj.type === "final") {
+                liveEl.textContent = "";
+                liveEl.innerHTML = "<em>—</em>";
+                const raw = (obj.text || "").trim();
+                if (raw) {
+                  transcriptSegments.push({ raw: raw });
+                  renderTranscriptHistory();
+                }
+              }
+            };
+
+            ws.onerror = () => setStatus("WebSocket error.", true);
+            ws.onclose = () => {
+              setStatus("WebSocket closed.");
+              stopRecording();
+            };
+          })
+          .catch((err) => {
+            setStatus("Microphone error: " + (err.message || "Permission denied"), true);
+          });
+      }
+
+      function stopRecording() {
+        isRecording = false;
+
+        // Stop MediaRecorder: do NOT clear recordedChunks before onstop — clear only inside onstop.
+        if (ENABLE_FRONTEND_RECORDING && mediaRecorder && mediaRecorder.state !== "inactive") {
+          mediaRecorder.onstop = () => {
+            if (DEBUG_AUDIO) console.log("[MediaRecorder] stopped, chunks:", recordedChunks.length);
+            if (recordedChunks.length === 0) {
+              recordedChunks = [];
+              return;
+            }
+            const chunks = recordedChunks.slice();
+            recordedChunks = [];
+            const mime = getRecordMimeType() || "audio/webm";
+            const blob = new Blob(chunks, { type: mime });
+            if (lastRecordingUrl) URL.revokeObjectURL(lastRecordingUrl);
+            lastRecordingUrl = URL.createObjectURL(blob);
+            const ext = getRecordFileExtension();
+            const filename = FILE_PREFIX + "_" + new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19) + "." + ext;
+            btnDownload.setAttribute("download", filename);
+            btnDownload.href = lastRecordingUrl;
+            btnDownload.style.display = "inline-block";
+          };
+          mediaRecorder.stop();
+        }
+        mediaRecorder = null;
+
+        if (workletNode) {
+          try {
+            workletNode.disconnect();
+          } catch (_) {}
+          workletNode = null;
+        }
+        if (sourceNode) {
+          try {
+            sourceNode.disconnect();
+          } catch (_) {}
+          sourceNode = null;
+        }
+        if (stream) {
+          stream.getTracks().forEach((t) => t.stop());
+          stream = null;
+        }
+        if (audioContext) {
+          audioContext.close().catch(() => {});
+          audioContext = null;
+        }
+        if (ws) {
+          ws.close();
+          ws = null;
+        }
+        btnStart.disabled = false;
+        btnStop.disabled = true;
+        liveEl.textContent = "";
+        liveEl.innerHTML = "<em>—</em>";
+        rawTranscript = transcriptSegments.map((s) => (typeof s === "string" ? s : s.raw)).join(" ").trim();
+        hasTranscript = rawTranscript.length > 0;
+        // TIDAK menyentuh session_id; chat tetap bisa dipakai setelah stop recording.
+        setStatus("Stopped.");
+      }
+
+      // --- Chat: dua arah via POST /api/chat; transcript hanya dikirim sekali (chat pertama) ---
+      function appendChatMessage(role, text) {
+        if (!chatMessagesEl) return;
+        const wrap = document.createElement("div");
+        wrap.className = "chat-msg " + (role === "user" ? "user" : "assistant");
+        const bubble = document.createElement("div");
+        bubble.className = "bubble";
+        bubble.textContent = text;
+        wrap.appendChild(bubble);
+        const meta = document.createElement("div");
+        meta.className = "meta";
+        meta.textContent = role === "user" ? "Anda" : "Asisten";
+        wrap.appendChild(meta);
+        chatMessagesEl.appendChild(wrap);
+        chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
+      }
+
+      btnChatSend.addEventListener("click", () => {
+        const text = (chatInputEl && chatInputEl.value || "").trim();
+        if (!text) return;
+        // Chat TIDAK BOLEH dikirim sebelum session_id ada (dari WebSocket transcript).
+        if (currentSessionId === null) {
+          setChatIndicator("Menunggu session transcript…", true);
+          return;
+        }
+        if (chatInputEl) chatInputEl.value = "";
+        appendChatMessage("user", text);
+        setChatIndicator("AI merespons…", true);
+
+        const base = getApiBaseUrl();
+        const url = base ? base + "/api/chat" : "";
+        const payload = { type: "chat", session_id: currentSessionId, message: text };
+
+        if (!url) {
+          setChatIndicator("", false);
+          appendChatMessage("assistant", "Error: URL API tidak tersedia. Set WebSocket URL.");
+          return;
+        }
+
+        fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        })
+          .then((res) => {
+            setChatIndicator("", false);
+            if (!res.ok) throw new Error(res.statusText || "Request gagal");
+            return res.json();
+          })
+          .then((data) => {
+            const reply = (data && (data.reply || data.text || data.message)) || "";
+            appendChatMessage("assistant", reply || "—");
+          })
+          .catch((err) => {
+            setChatIndicator("", false);
+            appendChatMessage("assistant", "Maaf, terjadi kesalahan. " + (err.message || "Coba lagi."));
+          });
+      });
+
+      // New Chat: hanya kosongkan UI chat; session_id TIDAK di-reset.
+      btnNewChat.addEventListener("click", () => {
+        if (chatMessagesEl) chatMessagesEl.innerHTML = "";
+        setChatIndicator("", false);
+      });
+
+      // New Session: reset session explicit; chat kosong. Session_id baru dari WS saat recording berikutnya.
+      btnNewSession.addEventListener("click", () => {
+        currentSessionId = null;
+        hasEverReceivedSession = false;
+        updateSessionIndicator();
+        if (chatMessagesEl) chatMessagesEl.innerHTML = "";
+        setChatIndicator("", false);
+      });
+
+      btnStart.addEventListener("click", startRecording);
+      btnStop.addEventListener("click", stopRecording);
+      // Download link: href + download attribute trigger browser download (must use <a> element).
+      if (!ENABLE_FRONTEND_RECORDING) btnDownload.style.display = "none";
+    })();
+  </script>
+  <!--
+  BROWSER COMPATIBILITY (Chrome, Edge):
+  - AudioWorklet: Chrome 66+, Edge 79+. Worklet is NOT connected to destination (capture only).
+  - MediaRecorder: Chrome 47+, Edge 79+. MIME fallback: audio/webm → audio/ogg.
+  - WebSocket: unchanged; PCM stream only.
+  - getUserMedia: echoCancellation/noiseSuppression/autoGainControl false for raw mic level.
+  -->
+</body>
+</html>
