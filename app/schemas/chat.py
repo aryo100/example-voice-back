@@ -35,10 +35,17 @@ class ChatRequest(BaseModel):
 
 
 class ChatResponse(BaseModel):
-    """Response body for POST /api/chat. session_id + reply for chat; reply only for reset."""
+    """Response body for POST /api/chat. session_id + text (assistant reply); audio for TTS when available."""
 
-    session_id: str | None = Field(None, description="Generated on first message; same for follow-ups")
-    reply: str = Field("", description="AI reply (conversational)")
+    session_id: str | None = Field(None, description="Same for entire session; never regenerated during chat")
+    text: str = Field("", description="Assistant reply (for display and TTS; never transcript content)")
+    audio: str | None = Field(None, description="TTS audio (e.g. base64) or null; only for assistant reply, never transcript")
+    trigger_audio: bool = Field(False, description="True when user invoked assistant by name (e.g. Salam); client should play TTS for this reply")
+    reply: str | None = Field(None, description="Legacy alias for text")
     mode: str | None = Field(None, description="Legacy: chat | refine")
-    message: str | None = Field(None, description="Legacy alias for reply")
+    message: str | None = Field(None, description="Legacy alias for text")
     refinement: RefineResponse | None = Field(None, description="Legacy: present only when mode=refine")
+
+    class Config:
+        # Populate text/reply/message for backward compatibility
+        populate_by_name = True

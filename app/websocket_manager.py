@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import time
 import uuid
@@ -31,9 +32,13 @@ from app.audio import (
 )
 from app.asr.base import ASREngine
 from app.config import get_settings
-from app.session_store import ensure_session_for_websocket, update_session_transcript
+from app.session_store import ensure_session_for_websocket, get_session, set_session, update_session_transcript
+from app.tts.service import synthesize_speech
 from app.transcript.merger import TranscriptMessage
 from app.transcript.writer import TranscriptWriterBase, create_transcript_writer
+from app.diarization import get_speaker_tracker
+
+logger = logging.getLogger(__name__)
 
 
 def _pcm_bytes_to_float32(pcm_bytes: bytes) -> np.ndarray:
@@ -43,7 +48,8 @@ def _pcm_bytes_to_float32(pcm_bytes: bytes) -> np.ndarray:
 
 
 def _normalize_commit_text(text: str) -> str:
-    """Before commit: strip repeated whitespace, remove trailing punctuation duplication."""
+    """Before commit: strip repeated whitespace, remove trailing punctuation duplication.
+    Jangan hilangkan duplikat kata (e.g. 'Salam Salam') agar pemanggilan asisten berkali-kali tetap terdeteksi."""
     if not text:
         return ""
     text = text.strip()
@@ -126,6 +132,21 @@ def _text_to_append(accumulated_lines: list[str], new_segment: str) -> str | Non
     return new
 
 
+def _format_final_line_for_session(text: str, speaker_id: str | None, overlap: bool) -> str:
+    """Format one final line for session transcript (chat sees speaker labels). Semua transcript huruf kecil."""
+    if not text:
+        return ""
+    content = (text or "").strip().lower()
+    if not content:
+        return ""
+    if speaker_id:
+        prefix = f"[{speaker_id}] "
+        if overlap:
+            prefix += "[overlap] "
+        return prefix + content
+    return content
+
+
 def _message_to_json(msg: TranscriptMessage) -> str:
     payload: dict = {
         "type": msg.type,
@@ -135,6 +156,15 @@ def _message_to_json(msg: TranscriptMessage) -> str:
     }
     if msg.word_timestamps:
         payload["word_timestamps"] = msg.word_timestamps
+    # Speaker-aware (final only)
+    if msg.speaker_id is not None:
+        payload["speaker_id"] = msg.speaker_id
+    if msg.start_time is not None:
+        payload["start_time"] = msg.start_time
+    if msg.end_time is not None:
+        payload["end_time"] = msg.end_time
+    if msg.overlap:
+        payload["overlap"] = True
     return json.dumps(payload)
 
 
@@ -165,6 +195,11 @@ class WebSocketManager:
         self._final_text: list[str] = []  # accumulated lines written (for overlap dedup with full transcript)
         self._chunker: AudioChunker | None = None
         self._rolling_buffer: RollingBuffer | None = None
+        self._speaker_tracker = get_speaker_tracker()
+
+    def _after_final_commit(self, line_for_session: str) -> None:
+        """Override di subclass untuk kirim assistant_reply via WS. Base: no-op."""
+        pass
 
     async def _send_message(self, msg: TranscriptMessage) -> None:
         if self._closed:
@@ -251,24 +286,45 @@ class WebSocketManager:
                         )
                         if text is None:
                             continue
-                        self._final_text.append(text)
+                        # Speaker-aware: assign speaker_id and overlap (diarization-only; no audio separation)
+                        speaker_id, overlap = self._speaker_tracker.assign(
+                            self._session_id,
+                            segment_start_session,
+                            segment_end_session,
+                            overlap_hint=False,
+                        )
+                        text_low = (text or "").strip().lower()
+                        line_for_session = _format_final_line_for_session(text_low, speaker_id, overlap)
+                        self._final_text.append(line_for_session)
                         await self._send_message(
                             TranscriptMessage(
                                 type="final",
-                                text=text,
+                                text=text_low,
                                 confidence=result.confidence,
                                 timestamp=ts_ms,
                                 word_timestamps=None,
+                                speaker_id=speaker_id,
+                                start_time=segment_start_session,
+                                end_time=segment_end_session,
+                                overlap=overlap,
                             )
                         )
                         if self._transcript_writer:
-                            self._transcript_writer.append_final(text, ts_ms)
+                            self._transcript_writer.append_final(
+                                text_low,
+                                ts_ms,
+                                speaker_id=speaker_id,
+                                start_time=segment_start_session,
+                                end_time=segment_end_session,
+                                overlap=overlap,
+                            )
                         # Update session transcript (only WebSocket updates transcript; chat only reads)
                         update_session_transcript(
                             self._session_id,
                             "\n".join(self._final_text),
                             transcript_finalized=False,
                         )
+                        self._after_final_commit(line_for_session)
                     else:
                         t = (seg.text or "").strip()
                         if t:
@@ -298,23 +354,46 @@ class WebSocketManager:
                             word_timestamps=None,
                         )
                     )
+                    # Speaker-aware: use chunk time range for segment times
+                    segment_start_session = chunk_start_sec
+                    segment_end_session = chunk_start_sec + chunk_dur
+                    speaker_id, overlap = self._speaker_tracker.assign(
+                        self._session_id,
+                        segment_start_session,
+                        segment_end_session,
+                        overlap_hint=False,
+                    )
+                    text_low = (text or "").strip().lower()
+                    line_for_session = _format_final_line_for_session(text_low, speaker_id, overlap)
+                    self._final_text.append(line_for_session)
                     await self._send_message(
                         TranscriptMessage(
                             type="final",
-                            text=text,
+                            text=text_low,
                             confidence=result.confidence,
                             timestamp=ts_ms,
                             word_timestamps=None,
+                            speaker_id=speaker_id,
+                            start_time=segment_start_session,
+                            end_time=segment_end_session,
+                            overlap=overlap,
                         )
                     )
                     if self._transcript_writer:
-                        self._transcript_writer.append_final(text, ts_ms)
-                    self._final_text.append(text)
+                        self._transcript_writer.append_final(
+                            text_low,
+                            ts_ms,
+                            speaker_id=speaker_id,
+                            start_time=segment_start_session,
+                            end_time=segment_end_session,
+                            overlap=overlap,
+                        )
                     update_session_transcript(
                         self._session_id,
                         "\n".join(self._final_text),
                         transcript_finalized=False,
                     )
+                    self._after_final_commit(line_for_session)
 
     async def run(self) -> None:
         """Main loop: receive binary, feed rolling buffer or chunker, run consumer."""
@@ -393,3 +472,104 @@ class WebSocketManager:
             )
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, self._recorder.finalize)
+
+
+# --- Subclass untuk route dengan assistant reply via WS ---
+def _transcript_contains_assistant(transcript_text: str) -> bool:
+    """True bila transcript berisi nama asisten atau alias (e.g. Salam). Dipakai di WS dengan assistant."""
+    if not (transcript_text or "").strip():
+        return False
+    settings = get_settings()
+    name = (getattr(settings, "ASSISTANT_NAME", "") or "Salam").strip().lower()
+    aliases_str = (getattr(settings, "ASSISTANT_NAME_ALIASES", "") or "").strip()
+    aliases = [a.strip().lower() for a in aliases_str.split(",") if a.strip()]
+    if name and name not in aliases:
+        aliases.insert(0, name)
+    transcript_lower = transcript_text.strip().lower()
+    return any(n and n in transcript_lower for n in aliases)
+
+
+class WebSocketManagerWithAssistant(WebSocketManager):
+    """
+    Sama seperti WebSocketManager, tapi saat transcript memanggil asisten (e.g. Salam),
+    kirim assistant_reply via WebSocket (type: assistant_reply, text, trigger_audio).
+    Pakai route /ws/transcribe-with-assistant.
+    """
+
+    def __init__(self, websocket: WebSocket, engine: ASREngine) -> None:
+        super().__init__(websocket, engine)
+        self._last_assistant_trigger_time: float = 0.0
+
+    def _after_final_commit(self, line_for_session: str) -> None:
+        if not _transcript_contains_assistant(line_for_session):
+            return
+        debounce_sec = getattr(get_settings(), "ASSISTANT_WS_DEBOUNCE_SEC", 15.0)
+        if time.time() - self._last_assistant_trigger_time < debounce_sec:
+            return
+        self._last_assistant_trigger_time = time.time()
+        asyncio.create_task(self._maybe_send_assistant_reply_ws(line_for_session))
+
+    async def _maybe_send_assistant_reply_ws(self, user_message: str) -> None:
+        if self._closed or not (user_message or "").strip():
+            return
+        try:
+            # Kirim waiting dulu; client tampilkan "Menunggu respons..." sampai assistant_reply (setelah LLM + TTS)
+            try:
+                await self._ws.send_text(
+                    json.dumps({"type": "assistant_processing", "message": "Menunggu respons..."})
+                )
+            except Exception:
+                pass
+            from app.services.chat_context import (
+                summarize_transcript_for_chat,
+                build_chat_system_prompt_for_tts,
+                _transcript_hash,
+            )
+            from app.services.refine_service import chat_with_ai_messages
+
+            session = get_session(self._session_id)
+            if not session:
+                return
+            transcript_text = session.get("transcript_text") or ""
+            current_hash = _transcript_hash(transcript_text)
+            stored_hash = session.get("transcript_summary_hash") or ""
+            need_summary = stored_hash != current_hash or not (session.get("global_summary") or "").strip()
+            if need_summary and transcript_text.strip():
+                try:
+                    summary_result = await summarize_transcript_for_chat(transcript_text)
+                    session["global_summary"] = summary_result.get("global_summary", "")
+                    session["segment_summaries"] = summary_result.get("segment_summaries", [])
+                    session["compressed_rolling_summary"] = summary_result.get("compressed_rolling_summary", "")
+                    session["transcript_summary_hash"] = current_hash
+                    set_session(self._session_id, session)
+                except Exception:
+                    pass
+            global_summary = session.get("global_summary") or "(No transcript yet.)"
+            compressed_rolling = session.get("compressed_rolling_summary") or ""
+            transcript_summary = global_summary.strip()
+            if compressed_rolling.strip():
+                transcript_summary = transcript_summary + "\n\n" + compressed_rolling.strip()
+            system_prompt = build_chat_system_prompt_for_tts(transcript_summary)
+            messages_for_llm = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message.strip()},
+            ]
+            reply = await chat_with_ai_messages(messages_for_llm)
+            if self._closed:
+                return
+            # TTS: lokal pakai Edge TTS; nanti Cloudflare pakai TTS dari sana
+            audio_b64, audio_mime = await synthesize_speech(reply)
+            if not audio_b64:
+                logger.warning(
+                    "assistant_reply: TTS failed (audio=null). Cek log: 403 = Edge TTS diblok (region/jaringan)? Set TTS_BACKEND=none untuk non-audio."
+                )
+            payload = json.dumps({
+                "type": "assistant_reply",
+                "text": reply,
+                "trigger_audio": True,
+                "audio": audio_b64,
+                "audio_mime": audio_mime or "audio/mpeg",
+            })
+            await self._ws.send_text(payload)
+        except Exception as e:
+            logger.exception("assistant_reply failed: %s", e)

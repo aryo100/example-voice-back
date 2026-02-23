@@ -32,6 +32,30 @@ def _format_timestamp_line(timestamp_ms: int, session_start_ms: int, text: str) 
     return f"[{mm:02d}:{ss:05.2f}] {text}".strip()
 
 
+def _format_speaker_line(
+    text: str,
+    timestamp_ms: Optional[int],
+    session_start_ms: int,
+    add_timestamps: bool,
+    speaker_id: Optional[str] = None,
+    overlap: bool = False,
+) -> str:
+    """Format one line with optional [MM:SS.ss], [Speaker A], [overlap] prefix.
+    Speaker labels and overlap are approximate; see diarization module limitations."""
+    parts: list[str] = []
+    if add_timestamps and timestamp_ms is not None:
+        elapsed_sec = (timestamp_ms - session_start_ms) / 1000.0
+        mm = int(elapsed_sec // 60)
+        ss = elapsed_sec % 60
+        parts.append(f"[{mm:02d}:{ss:05.2f}]")
+    if speaker_id:
+        parts.append(f"[{speaker_id}]")
+    if overlap:
+        parts.append("[overlap]")
+    parts.append(text.strip())
+    return " ".join(parts)
+
+
 class TranscriptWriterBase(ABC):
     """Base for session transcript writer. Only final segments are appended; partial is never written."""
 
@@ -41,7 +65,15 @@ class TranscriptWriterBase(ABC):
         ...
 
     @abstractmethod
-    def append_final(self, text: str, timestamp_ms: Optional[int] = None) -> None:
+    def append_final(
+        self,
+        text: str,
+        timestamp_ms: Optional[int] = None,
+        speaker_id: Optional[str] = None,
+        start_time: Optional[float] = None,
+        end_time: Optional[float] = None,
+        overlap: bool = False,
+    ) -> None:
         """Append one final segment (one line). Non-blocking; queues write. Partial must never call this."""
         ...
 
@@ -57,7 +89,15 @@ class NoOpTranscriptWriter(TranscriptWriterBase):
     async def start(self) -> None:
         pass
 
-    def append_final(self, text: str, timestamp_ms: Optional[int] = None) -> None:
+    def append_final(
+        self,
+        text: str,
+        timestamp_ms: Optional[int] = None,
+        speaker_id: Optional[str] = None,
+        start_time: Optional[float] = None,
+        end_time: Optional[float] = None,
+        overlap: bool = False,
+    ) -> None:
         pass
 
     async def close(self) -> None:
@@ -122,12 +162,24 @@ class TranscriptWriter(TranscriptWriterBase):
             logger.warning("Transcript file open failed for %s: %s", self._path, e)
         self._worker_task = asyncio.create_task(self._worker())
 
-    def append_final(self, text: str, timestamp_ms: Optional[int] = None) -> None:
+    def append_final(
+        self,
+        text: str,
+        timestamp_ms: Optional[int] = None,
+        speaker_id: Optional[str] = None,
+        start_time: Optional[float] = None,
+        end_time: Optional[float] = None,
+        overlap: bool = False,
+    ) -> None:
         """Append one final segment. Partial must never call this. Non-blocking (queue)."""
         text = (text or "").strip()
         if not text:
             return
-        if self._add_timestamps and timestamp_ms is not None:
+        if speaker_id is not None or overlap:
+            line = _format_speaker_line(
+                text, timestamp_ms, self._session_start_ms, self._add_timestamps, speaker_id, overlap
+            )
+        elif self._add_timestamps and timestamp_ms is not None:
             line = _format_timestamp_line(timestamp_ms, self._session_start_ms, text)
         else:
             line = text

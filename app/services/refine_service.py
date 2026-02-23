@@ -369,6 +369,20 @@ async def refine_raw_transcript(transcript: str, user_question: str) -> str:
     return "\n".join(s.refined_text for s in response.segments if s.refined_text)
 
 
+def _log_chat_request(model: str, max_tokens: int, messages: list[dict[str, str]], max_content_len: int = 2000) -> None:
+    """Log payload sent to Cloudflare LLM (content truncated for readability)."""
+    logger.info(
+        "LLM request to Cloudflare: model=%s, max_tokens=%s, messages=%s",
+        model, max_tokens, len(messages),
+    )
+    for i, msg in enumerate(messages):
+        role = msg.get("role", "?")
+        content = (msg.get("content") or "").strip()
+        length = len(content)
+        display = content if length <= max_content_len else content[:max_content_len] + f"\n... [truncated, total {length} chars]"
+        logger.info("  [%s] role=%s len=%s:\n%s", i, role, length, display)
+
+
 async def chat_with_ai_messages(messages: list[dict[str, str]]) -> str:
     """
     Call Cloudflare Workers AI with full message history. Returns assistant reply only.
@@ -391,6 +405,8 @@ async def chat_with_ai_messages(messages: list[dict[str, str]]) -> str:
         "max_tokens": max_tokens,
         "temperature": 0.4,
     }
+
+    _log_chat_request(model, max_tokens, messages)
 
     async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(

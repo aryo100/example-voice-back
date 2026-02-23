@@ -8,7 +8,16 @@ import time
 import uuid
 from typing import Any
 
-# session_id -> { "messages": [...], "transcript_text": str, "transcript_finalized": bool, "created_at": float }
+# session_id -> {
+#   "messages": [...],
+#   "transcript_text": str,            # transcript_raw: full text; never sent to TTS, never rewritten by chat
+#   "transcript_finalized": bool,
+#   "created_at": float,
+#   "global_summary": str,             # part of transcript_summary (compressed context for LLM only)
+#   "segment_summaries": list[str],   # optional
+#   "compressed_rolling_summary": str, # part of transcript_summary when transcript is large
+#   "transcript_summary_hash": str,   # invalidates summary when transcript changes
+# }
 _session_store: dict[str, dict[str, Any]] = {}
 
 
@@ -44,6 +53,25 @@ def ensure_session_for_websocket(session_id: str) -> None:
             "transcript_finalized": False,
             "created_at": time.time(),
         }
+
+
+def ensure_session_from_transcript_file(session_id: str, transcript_text: str) -> dict[str, Any] | None:
+    """
+    If session is not in memory but transcript_text is provided (e.g. loaded from transcripts/{session_id}.txt),
+    create session in memory with that transcript and return it. Return None if transcript_text is empty.
+    Used by chat endpoint so session_id that matches a transcript file works after server restart.
+    """
+    if session_id in _session_store:
+        return _session_store[session_id]
+    if not (transcript_text or "").strip():
+        return None
+    _session_store[session_id] = {
+        "messages": [],
+        "transcript_text": transcript_text.strip(),
+        "transcript_finalized": True,
+        "created_at": time.time(),
+    }
+    return _session_store[session_id]
 
 
 def update_session_transcript(

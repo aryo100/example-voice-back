@@ -43,7 +43,7 @@
   <p style="font-size: 0.9rem; color: #64748b;">Microphone → PCM → WebSocket → transcript. Chat via /api/chat. <strong>Hindari CORS:</strong> jalankan <code>python server.py</code> di folder ini, lalu buka <code>http://localhost:8080/stream_test.html</code>.</p>
 
   <label for="wsUrl">WebSocket URL</label>
-  <input type="text" id="wsUrl" value="ws://localhost:8000/ws/transcribe" placeholder="ws://localhost:8000/ws/transcribe" />
+  <input type="text" id="wsUrl" value="ws://localhost:8000/ws/transcribe-with-assistant" placeholder="ws://localhost:8000/ws/transcribe-with-assistant" />
 
   <button id="btnStart">Start recording</button>
   <button id="btnStop" disabled>Stop recording</button>
@@ -201,6 +201,7 @@
       // session_id HANYA dari WebSocket transcript (type "session" atau partial/final dengan session_id). Frontend TIDAK generate.
       let currentSessionId = null;
       let hasEverReceivedSession = false;  // true setelah pernah dapat session_id dari WS; tidak di-reset saat stop recording
+      let currentAiAudio = null;  // AI voice reply; stop when user sends new message (transcript is NEVER played)
 
       // MediaRecorder MIME fallback: audio/webm → audio/ogg. (audio/wav not supported by MediaRecorder.)
       function getRecordMimeType() {
@@ -380,6 +381,16 @@
                   transcriptSegments.push({ raw: raw });
                   renderTranscriptHistory();
                 }
+              } else if (obj.type === "assistant_reply") {
+                const replyText = (obj.text || "").trim();
+                if (replyText) appendChatMessage("assistant", replyText);
+                if (obj.trigger_audio && obj.audio) {
+                  const mime = obj.audio_mime || "audio/mpeg";
+                  const src = /^(https?:|data:)/i.test(obj.audio)
+                    ? obj.audio
+                    : "data:" + mime + ";base64," + obj.audio;
+                  playAiAudioIfPresent(src);
+                }
               }
             };
 
@@ -472,21 +483,37 @@
         chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
       }
 
+      // Stop any playing AI audio when user sends new message. Transcript is NEVER spoken.
+      function stopCurrentAiAudio() {
+        if (currentAiAudio) {
+          try {
+            currentAiAudio.pause();
+            currentAiAudio.currentTime = 0;
+          } catch (_) {}
+          currentAiAudio = null;
+        }
+      }
+
+      function playAiAudioIfPresent(src) {
+        if (!src || typeof src !== "string") return;
+        stopCurrentAiAudio();
+        try {
+          currentAiAudio = new Audio(src);
+          currentAiAudio.play().catch(() => {});
+        } catch (_) {}
+      }
+
       btnChatSend.addEventListener("click", () => {
         const text = (chatInputEl && chatInputEl.value || "").trim();
         if (!text) return;
-        // Chat TIDAK BOLEH dikirim sebelum session_id ada (dari WebSocket transcript).
-        if (currentSessionId === null) {
-          setChatIndicator("Menunggu session transcript…", true);
-          return;
-        }
+        stopCurrentAiAudio();
         if (chatInputEl) chatInputEl.value = "";
         appendChatMessage("user", text);
         setChatIndicator("AI merespons…", true);
 
         const base = getApiBaseUrl();
         const url = base ? base + "/api/chat" : "";
-        const payload = { type: "chat", session_id: currentSessionId, message: text };
+        const payload = { session_id: currentSessionId, message: text };
 
         if (!url) {
           setChatIndicator("", false);
@@ -505,8 +532,9 @@
             return res.json();
           })
           .then((data) => {
-            const reply = (data && (data.reply || data.text || data.message)) || "";
+            const reply = (data && (data.text || data.reply || data.message)) || "";
             appendChatMessage("assistant", reply || "—");
+            if (data && data.audio) playAiAudioIfPresent(data.audio);
           })
           .catch((err) => {
             setChatIndicator("", false);

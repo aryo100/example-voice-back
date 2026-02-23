@@ -12,13 +12,24 @@ from typing import Callable
 
 @dataclass
 class TranscriptMessage:
-    """Message sent to client over WebSocket."""
+    """
+    Message sent to client over WebSocket.
+
+    Partial transcripts may not include speaker info.
+    Final transcripts must be speaker-tagged when diarization is enabled;
+    speaker assignment may be revised on finalization.
+    """
 
     type: str  # "partial" | "final"
     text: str
     confidence: float
     timestamp: int  # unix_ms
     word_timestamps: list[dict] | None = None  # [{"word": str, "start": float, "end": float}]
+    # Speaker-aware (final only; partial may omit)
+    speaker_id: str | None = None  # e.g. "Speaker A", "Speaker B"
+    start_time: float | None = None  # segment start, session-relative seconds
+    end_time: float | None = None   # segment end, session-relative seconds
+    overlap: bool = False          # True when overlapping speech detected
 
 
 def _unix_ms() -> int:

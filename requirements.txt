@@ -19,5 +19,8 @@ pydub>=0.25.0
 # HTTP client for remote ASR
 httpx>=0.26.0
 
+# TTS (untuk balasan asisten; local). 7.2.7+ perbaiki 403 dari Bing Speech.
+edge-tts>=7.2.7
+
 # Config
 pydantic-settings>=2.1.0
