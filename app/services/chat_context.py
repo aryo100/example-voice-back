@@ -13,13 +13,12 @@ import logging
 import re
 from typing import Any
 
-import httpx
-
-from app.config import Settings, get_settings
+from app.config import get_settings
+from app.services.llm_provider import completion as llm_completion
 
 logger = logging.getLogger(__name__)
 
-# --- Config defaults (can be overridden in Settings) ---
+# --- Config defaults (can be overridden in config) ---
 CHAT_GLOBAL_SUMMARY_MAX_WORDS = 80  # ~100 tokens
 CHAT_SEGMENT_SUMMARIES_COUNT = 5
 CHAT_SNIPPET_MAX_CHARS = 600  # ~10–20 sec of text
@@ -33,13 +32,6 @@ CHAT_ROLLING_MAX_CHARS = 4000
 def _transcript_hash(transcript_text: str) -> str:
     """Stable hash of transcript for cache invalidation (summary recompute when transcript changes)."""
     return hashlib.sha256((transcript_text or "").strip().encode("utf-8")).hexdigest()[:16]
-
-
-def _get_cloudflare_auth(settings: Settings) -> tuple[str, str]:
-    """Return (account_id, token) for Workers AI."""
-    account_id = (getattr(settings, "CLOUDFLARE_ACCOUNT_ID", "") or "").strip()
-    token = (getattr(settings, "CLOUDFLARE_API_TOKEN", "") or "").strip()
-    return account_id, token
 
 
 _SUMMARIZE_SYSTEM = """You are a summarizer. Given a voice transcript, output exactly two parts in plain text.
@@ -69,11 +61,14 @@ def _parse_summary_response(raw: str) -> dict[str, Any]:
     global_summary = ""
     segment_summaries: list[str] = []
 
-    # GLOBAL SUMMARY: ... (until SEGMENT SUMMARIES: or end)
+    # GLOBAL SUMMARY: ... (until SEGMENT SUMMARIES: or end). Batas dari config agar full context tidak terpotong.
     gs_match = re.search(r"GLOBAL SUMMARY:\s*\n(.*?)(?=SEGMENT SUMMARIES:|\Z)", raw, re.DOTALL | re.IGNORECASE)
     if gs_match:
         global_summary = gs_match.group(1).strip()
-        global_summary = re.sub(r"\n+", " ", global_summary)[:600]
+        global_summary = re.sub(r"\n+", " ", global_summary)
+        max_chars = getattr(get_settings(), "CHAT_GLOBAL_SUMMARY_MAX_CHARS", 4000)
+        if len(global_summary) > max_chars:
+            global_summary = global_summary[:max_chars] + "..."
 
     # SEGMENT SUMMARIES: 1. ... 2. ...
     ss_match = re.search(r"SEGMENT SUMMARIES:\s*\n(.*)", raw, re.DOTALL | re.IGNORECASE)
@@ -90,6 +85,15 @@ def _parse_summary_response(raw: str) -> dict[str, Any]:
             else:
                 segment_summaries.append(line)
         segment_summaries = segment_summaries[:CHAT_SEGMENT_SUMMARIES_COUNT]
+
+    if not (global_summary or "").strip() and (raw or "").strip():
+        # Model sering tidak mengikuti label GLOBAL SUMMARY: — pakai teks respons apa adanya (dibatasi).
+        fallback = re.sub(r"\s+", " ", raw).strip()
+        max_chars = getattr(get_settings(), "CHAT_GLOBAL_SUMMARY_MAX_CHARS", 4000)
+        if len(fallback) > max_chars:
+            fallback = fallback[:max_chars] + "..."
+        if fallback:
+            global_summary = fallback
 
     return {"global_summary": global_summary or "No summary.", "segment_summaries": segment_summaries}
 
@@ -143,36 +147,12 @@ def _chunk_transcript(transcript_text: str, chunk_chars: int) -> list[str]:
 
 
 async def _call_llm_summary(system_prompt: str, user_content: str, max_output_tokens: int = 512) -> str:
-    """Single LLM call for summarization. Returns raw response text."""
-    settings = get_settings()
-    account_id, token = _get_cloudflare_auth(settings)
-    if not account_id or not token:
-        return ""
-    model = getattr(settings, "REFINE_CF_MODEL", "@cf/meta/llama-3.1-8b-instruct")
-    url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{model}"
-    payload = {
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content},
-        ],
-        "max_tokens": max_output_tokens,
-        "temperature": 0.2,
-    }
-    try:
-        async with httpx.AsyncClient(timeout=45.0) as client:
-            resp = await client.post(
-                url,
-                json=payload,
-                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-    except Exception as e:
-        logger.warning("LLM summary call failed: %s", e)
-        return ""
-    result = data.get("result", data)
-    content = (result.get("response", "") if isinstance(result, dict) else (result if isinstance(result, str) else "")) or ""
-    return (content or "").strip()
+    """Single LLM call for summarization (OpenRouter → Cloudflare → Hugging Face). Returns raw response text."""
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content},
+    ]
+    return await llm_completion(messages, max_tokens=max_output_tokens, temperature=0.2, timeout=45.0)
 
 
 async def _summarize_batch(chunk: str) -> str:
@@ -189,51 +169,105 @@ async def _re_summarize_rolling(rolling_text: str) -> str:
     return await _call_llm_summary(_RE_SUMMARIZE_ROLLING_SYSTEM, f"Compress these accumulated summaries:\n\n{rolling_text}", max_output_tokens=1024)
 
 
-async def run_compression_loop(transcript_text: str) -> dict[str, Any]:
+def _heuristic_global_summary(transcript_text: str) -> str:
+    words = transcript_text.split()[:CHAT_GLOBAL_SUMMARY_MAX_WORDS]
+    return " ".join(words) + ("..." if len(transcript_text.split()) > CHAT_GLOBAL_SUMMARY_MAX_WORDS else "")
+
+
+async def run_compression_loop(
+    transcript_text: str,
+    *,
+    max_batch_calls: int | None = None,
+    chunk_chars_override: int | None = None,
+) -> dict[str, Any]:
     """
     Iterative context compression: chunk transcript → summarize each batch → merge into rolling summary;
     re-summarize rolling summary when it exceeds ROLLING_MAX_CHARS. Never send full transcript at once.
     Returns {"global_summary": str, "compressed_rolling_summary": str, "segment_summaries": list} for compatibility.
     Cached per session by caller using transcript_hash; re-run only when new transcript data arrives.
+
+    max_batch_calls: batasi jumlah batch LLM (mis. saat /api/session/activate).
+    chunk_chars_override: ukuran chunk sementara (mis. chunk lebih besar saat activate).
     """
     transcript_text = (transcript_text or "").strip()
     if not transcript_text:
         return {"global_summary": "(No transcript yet.)", "compressed_rolling_summary": "", "segment_summaries": []}
 
     settings = get_settings()
-    threshold = getattr(settings, "CHAT_COMPRESSION_THRESHOLD_CHARS", CHAT_COMPRESSION_THRESHOLD_CHARS)
-    chunk_chars = getattr(settings, "CHAT_CHUNK_CHARS", CHAT_CHUNK_CHARS)
+    chunk_chars = chunk_chars_override or getattr(settings, "CHAT_CHUNK_CHARS", CHAT_CHUNK_CHARS)
     rolling_max = getattr(settings, "CHAT_ROLLING_MAX_CHARS", CHAT_ROLLING_MAX_CHARS)
 
     chunks = _chunk_transcript(transcript_text, chunk_chars)
     if not chunks:
         return {"global_summary": "(No content.)", "compressed_rolling_summary": "", "segment_summaries": []}
 
-    logger.info("Compression loop: %s chunks (chunk_chars=%s)", len(chunks), chunk_chars)
+    total_chunks = len(chunks)
+    if max_batch_calls is not None:
+        chunks = chunks[: max(0, max_batch_calls)]
+        if total_chunks > len(chunks):
+            logger.info(
+                "Compression loop: memproses %s/%s batch (batas aktivasi cepat; chunk_chars=%s)",
+                len(chunks),
+                total_chunks,
+                chunk_chars,
+            )
+    else:
+        logger.info("Compression loop: %s chunks (chunk_chars=%s)", len(chunks), chunk_chars)
+
     rolling: list[str] = []
+    stopped_all_providers_failed = False
     for i, chunk in enumerate(chunks):
-        batch_summary = await _summarize_batch(chunk)
+        try:
+            batch_summary = await _summarize_batch(chunk)
+        except ValueError as e:
+            logger.warning(
+                "Compression loop: semua provider LLM gagal pada batch %s/%s; hentikan. %s",
+                i + 1,
+                len(chunks),
+                e,
+            )
+            stopped_all_providers_failed = True
+            break
         if not batch_summary:
             continue
         rolling.append(batch_summary)
         merged = "\n\n".join(rolling)
         if len(merged) > rolling_max:
-            compressed = await _re_summarize_rolling(merged)
+            try:
+                compressed = await _re_summarize_rolling(merged)
+            except ValueError as e:
+                logger.warning("Compression loop: re-summarize rolling gagal (semua provider); lanjut tanpa kompresi. %s", e)
+                compressed = ""
             if compressed:
                 rolling = [compressed]
             # else keep rolling as-is to avoid loss
     compressed_rolling_summary = "\n\n".join(rolling)
+    if stopped_all_providers_failed and not compressed_rolling_summary.strip():
+        return {
+            "global_summary": _heuristic_global_summary(transcript_text) or "(Ringkasan tidak tersedia; semua provider LLM gagal.)",
+            "compressed_rolling_summary": "",
+            "segment_summaries": [],
+        }
+    if max_batch_calls is not None and total_chunks > len(chunks) and compressed_rolling_summary.strip():
+        compressed_rolling_summary += (
+            "\n\n[Catatan: ringkasan aktivasi dibatasi; sebagian transcript belum diproses LLM.]"
+        )
 
     # Global summary: one short pass over first chunk or over compressed if single block
+    max_global_chars = getattr(get_settings(), "CHAT_GLOBAL_SUMMARY_MAX_CHARS", 4000)
     if len(compressed_rolling_summary) > 800:
-        global_summary = await _call_llm_summary(
-            "In at most 80 words, summarize the following in one short paragraph. Do not invent information.",
-            compressed_rolling_summary[:4000],
-            max_output_tokens=150,
-        )
-        global_summary = global_summary or "Long transcript; see detailed compressed summary below."
+        try:
+            global_summary = await _call_llm_summary(
+                "In at most 80 words, summarize the following in one short paragraph. Do not invent information.",
+                compressed_rolling_summary[:4000],
+                max_output_tokens=150,
+            )
+            global_summary = global_summary or "Long transcript; see detailed compressed summary below."
+        except ValueError as e:
+            logger.warning("Compression loop: global summary LLM gagal; pakai ringkasan heuristik. %s", e)
+            global_summary = _heuristic_global_summary(compressed_rolling_summary) or "Long transcript; see detailed compressed summary below."
     else:
-        global_summary = compressed_rolling_summary[:500] if compressed_rolling_summary else "See compressed summary below."
+        global_summary = (compressed_rolling_summary[:max_global_chars] if compressed_rolling_summary else "See compressed summary below.")
 
     return {
         "global_summary": global_summary or "Long transcript; see compressed summary below.",
@@ -242,12 +276,14 @@ async def run_compression_loop(transcript_text: str) -> dict[str, Any]:
     }
 
 
-async def summarize_transcript_for_chat(transcript_text: str) -> dict[str, Any]:
+async def summarize_transcript_for_chat(transcript_text: str, *, activate: bool = False) -> dict[str, Any]:
     """
     Produce global summary + segment summaries (or compressed rolling summary when transcript is long).
     When transcript exceeds CHAT_COMPRESSION_THRESHOLD_CHARS, use iterative compression loop;
     otherwise one LLM call. Returns {"global_summary", "segment_summaries", "compressed_rolling_summary"}.
     Transcript is never sent in full; we send only summaries.
+
+    activate=True (mis. dari /api/session/activate): batasi batch LLM + chunk lebih besar agar respons cepat.
     """
     transcript_text = (transcript_text or "").strip()
     if not transcript_text:
@@ -256,55 +292,45 @@ async def summarize_transcript_for_chat(transcript_text: str) -> dict[str, Any]:
     settings = get_settings()
     threshold = getattr(settings, "CHAT_COMPRESSION_THRESHOLD_CHARS", CHAT_COMPRESSION_THRESHOLD_CHARS)
     if len(transcript_text) > threshold:
-        result = await run_compression_loop(transcript_text)
+        if activate:
+            max_b = int(getattr(settings, "CHAT_ACTIVATE_MAX_COMPRESSION_BATCHES", 6) or 6)
+            chunk_ovr = int(getattr(settings, "CHAT_ACTIVATE_CHUNK_CHARS", 0) or 0) or None
+            result = await run_compression_loop(
+                transcript_text,
+                max_batch_calls=max(1, max_b),
+                chunk_chars_override=chunk_ovr,
+            )
+        else:
+            result = await run_compression_loop(transcript_text)
         return {
             "global_summary": result.get("global_summary", ""),
             "segment_summaries": result.get("segment_summaries", []),
             "compressed_rolling_summary": result.get("compressed_rolling_summary", ""),
         }
 
-    account_id, token = _get_cloudflare_auth(settings)
-    if not account_id or not token:
-        logger.warning("Cloudflare auth missing; returning heuristic summary")
-        # Fallback: first 80 words as "summary"
-        words = transcript_text.split()[:CHAT_GLOBAL_SUMMARY_MAX_WORDS]
-        return {"global_summary": " ".join(words) + ("..." if len(transcript_text.split()) > CHAT_GLOBAL_SUMMARY_MAX_WORDS else ""), "segment_summaries": [], "compressed_rolling_summary": ""}
-
-    model = getattr(settings, "REFINE_CF_MODEL", "@cf/meta/llama-3.1-8b-instruct")
+    # Short path: one LLM call (OpenRouter → Cloudflare → Hugging Face)
     max_tokens = getattr(settings, "REFINE_CHAT_MAX_TOKENS", 2048)
-    # Truncate transcript for summary call to stay within context
     max_chars_for_summary = 12000
     transcript_for_summary = transcript_text if len(transcript_text) <= max_chars_for_summary else transcript_text[:max_chars_for_summary] + "\n[... truncated ...]"
-
-    url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{model}"
-    payload = {
-        "messages": [
-            {"role": "system", "content": _SUMMARIZE_SYSTEM},
-            {"role": "user", "content": f"Summarize this voice transcript:\n\n{transcript_for_summary}"},
-        ],
-        "max_tokens": max_tokens,
-        "temperature": 0.2,
-    }
-
+    messages = [
+        {"role": "system", "content": _SUMMARIZE_SYSTEM},
+        {"role": "user", "content": f"Summarize this voice transcript:\n\n{transcript_for_summary}"},
+    ]
     try:
-        async with httpx.AsyncClient(timeout=45.0) as client:
-            resp = await client.post(
-                url,
-                json=payload,
-                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            )
-            resp.raise_for_status()
-            data = resp.json()
+        content = await llm_completion(messages, max_tokens=max_tokens, temperature=0.2, timeout=45.0)
+        out = _parse_summary_response(content)
+        out["compressed_rolling_summary"] = ""
+        return out
+    except ValueError:
+        logger.warning("No LLM provider available; using heuristic summary")
     except Exception as e:
         logger.warning("Summarization failed: %s; using heuristic", e)
-        words = transcript_text.split()[:CHAT_GLOBAL_SUMMARY_MAX_WORDS]
-        return {"global_summary": " ".join(words) + ("..." if len(transcript_text.split()) > CHAT_GLOBAL_SUMMARY_MAX_WORDS else ""), "segment_summaries": [], "compressed_rolling_summary": ""}
-
-    result = data.get("result", data)
-    content = (result.get("response", "") if isinstance(result, dict) else (result if isinstance(result, str) else "")) or ""
-    out = _parse_summary_response(content)
-    out["compressed_rolling_summary"] = ""
-    return out
+    words = transcript_text.split()[:CHAT_GLOBAL_SUMMARY_MAX_WORDS]
+    return {
+        "global_summary": " ".join(words) + ("..." if len(transcript_text.split()) > CHAT_GLOBAL_SUMMARY_MAX_WORDS else ""),
+        "segment_summaries": [],
+        "compressed_rolling_summary": "",
+    }
 
 
 def select_relevant_snippets(transcript_text: str, user_question: str, max_chars: int = CHAT_SNIPPET_MAX_CHARS) -> str:
@@ -423,6 +449,183 @@ def build_chat_system_prompt_for_tts(transcript_summary: str) -> str:
         f"{transcript_summary or '(No transcript yet.)'}\n"
         '"""'
     )
+
+
+def build_llm_compact_knowledge_system_prompt(knowledge_text: str) -> str:
+    """
+    System prompt untuk CHAT_LLM_COMPACT_KNOWLEDGE: isi knowledge tanpa label CONTEXT / Transcript summary.
+    """
+    body = (knowledge_text or "").strip() or "(No knowledge yet.)"
+    return (
+        "You are a conversational AI assistant.\n"
+        "You have access to session knowledge derived from voice transcripts (may be partial or summarized).\n"
+        "Do NOT repeat content verbatim unless asked.\n"
+        "Respond naturally for spoken output.\n"
+        "Do NOT include timestamps or speaker labels.\n\n"
+        '"""\n'
+        f"{body}\n"
+        '"""'
+    )
+
+
+def build_chat_knowledge_base_system_prompt(extra_instructions: str = "") -> str:
+    """
+    Pesan system pertama saat CHAT_KNOWLEDGE_MULTI_SYSTEM: instruksi umum (tanpa isi transkrip).
+    Pesan system berikutnya = segmen transkrip per chunk baris.
+    """
+    extra = (extra_instructions or "").strip()
+    parts = [
+        "You are a conversational AI assistant for a voice session.",
+        "The following additional system messages are consecutive transcript segments (read-only knowledge).",
+        "Each segment header states the inclusive line range (1-based, file order).",
+        "Answer the user using this knowledge; do not invent facts not supported by the transcript.",
+        "Respond naturally for spoken output.",
+        "Do NOT include timestamps or speaker labels in your reply unless the user explicitly asks.",
+    ]
+    if extra:
+        parts.extend(["", "ADDITIONAL INSTRUCTIONS:", extra])
+    return "\n".join(parts)
+
+
+def build_transcript_knowledge_system_messages(
+    transcript_text: str,
+    *,
+    lines_per_chunk: int = 50,
+    max_chunks: int = 40,
+    max_chars_per_chunk: int = 12000,
+) -> list[dict[str, str]]:
+    """
+    Satu dict per chunk: {"role": "system", "content": "Transkrip dialog baris X–Y:\\n..."}.
+    Urutan kronologis; memudahkan provider yang membatasi ukuran satu body besar.
+    """
+    text = (transcript_text or "").strip()
+    if not text:
+        return [{"role": "system", "content": "(Tidak ada transkrip di session.)"}]
+
+    lines = text.splitlines()
+    if lines_per_chunk < 1:
+        lines_per_chunk = 50
+    if max_chunks < 1:
+        max_chunks = 40
+    if max_chars_per_chunk < 500:
+        max_chars_per_chunk = 500
+
+    out: list[dict[str, str]] = []
+    total_line_groups = (len(lines) + lines_per_chunk - 1) // lines_per_chunk
+    capped_groups = min(total_line_groups, max_chunks)
+    if total_line_groups > max_chunks:
+        logger.warning(
+            "Transcript knowledge: %s baris → %s chunk (dibatasi CHAT_KNOWLEDGE_MAX_CHUNKS=%s)",
+            len(lines),
+            total_line_groups,
+            max_chunks,
+        )
+
+    for g in range(capped_groups):
+        i0 = g * lines_per_chunk
+        chunk_lines = lines[i0 : i0 + lines_per_chunk]
+        start = i0 + 1
+        end = i0 + len(chunk_lines)
+        body = "\n".join(chunk_lines)
+        if len(body) > max_chars_per_chunk:
+            body = body[: max_chars_per_chunk - 40] + "\n[... segmen dipotong (CHAT_KNOWLEDGE_MAX_CHARS_PER_CHUNK) ...]"
+        content = f"Transkrip dialog baris {start}–{end}:\n{body}"
+        out.append({"role": "system", "content": content})
+    return out
+
+
+def summary_field_invalid_for_llm(global_summary: str | None) -> bool:
+    """True bila ringkasan session tidak boleh dipakai sebagai satu-satunya knowledge LLM."""
+    gs = (global_summary or "").strip()
+    if not gs:
+        return True
+    bad = {
+        "no summary.",
+        "(no transcript yet.)",
+        "(transcript summary unavailable.)",
+    }
+    return gs.lower() in bad
+
+
+def _merge_global_and_compressed(global_summary: str | None, compressed_rolling: str | None) -> str:
+    gs = (global_summary or "").strip()
+    if gs.lower() in ("no summary.", "(no transcript yet.)"):
+        gs = ""
+    cr = (compressed_rolling or "").strip()
+    if gs and cr:
+        return f"{gs}\n\n{cr}"
+    return gs or cr or ""
+
+
+def build_chat_system_prompt_llm_compact(
+    *,
+    parts: str,
+    global_summary: str,
+    compressed_rolling: str,
+    relevant_snippets: str,
+    extra_instructions: str = "",
+    transcript_text: str | None = None,
+    user_question: str | None = None,
+    knowledge_omit_summary: bool = False,
+) -> str:
+    """
+    System prompt untuk mode compact (hindari payload besar).
+
+    parts:
+    - both: ringkasan global + compressed + cuplikan relevan (default).
+    - summary_only: ringkasan + compressed saja (tanpa blok excerpt ganda).
+    - excerpt_only: tanpa ringkasan global; hanya cuplikan relevan + instruksi tambahan (paling ringan).
+
+    knowledge_omit_summary=True (CHAT_LLM_COMPACT_KNOWLEDGE): tidak mengirim ringkasan session, cuplikan,
+    atau teks transkrip terpotong ke LLM — hanya instruksi peran + CHAT_LLM_EXTRA_SYSTEM_PROMPT.
+    """
+    extra = (extra_instructions or "").strip()
+
+    if knowledge_omit_summary:
+        lines = [
+            "You are a conversational AI assistant for a voice session.",
+            "A transcript exists for this session but is not included in this request: no excerpts, no truncated transcript lines, and no summary text from the transcript.",
+            "Answer from the user's message and general reasoning; if the answer depends on transcript content you were not given, say so briefly.",
+            "Respond naturally for spoken output.",
+            "Do NOT include timestamps or speaker labels in your reply.",
+        ]
+        if extra:
+            lines.extend(["", "ADDITIONAL INSTRUCTIONS:", extra])
+        return "\n".join(lines)
+
+    if parts == "excerpt_only":
+        body = (relevant_snippets or "").strip() or "(Tidak ada cuplikan relevan untuk pertanyaan ini.)"
+        lines = [
+            "You are a conversational AI assistant.",
+            "You only have a short relevant excerpt from a longer voice transcript (not the full transcript).",
+            "Answer the user's question using the excerpt; if it is not enough to answer, say so briefly.",
+            "Respond naturally for spoken output.",
+            "Do NOT include timestamps or speaker labels.",
+        ]
+        if extra:
+            lines.extend(["", "ADDITIONAL INSTRUCTIONS:", extra])
+        lines.extend(["", "RELEVANT EXCERPT:", '"""', body, '"""'])
+        return "\n".join(lines)
+
+    transcript_summary = _merge_global_and_compressed(global_summary, compressed_rolling)
+    used_wide_fallback = False
+    if summary_field_invalid_for_llm(transcript_summary) and (transcript_text or "").strip():
+        fb = int(getattr(get_settings(), "CHAT_LLM_KNOWLEDGE_FALLBACK_SNIPPET_CHARS", 12000) or 12000)
+        uq = (user_question or "").strip()
+        digest = select_relevant_snippets(transcript_text or "", uq, max_chars=max(400, fb))
+        if digest.strip():
+            transcript_summary = (
+                "Bounded transcript context (excerpt from session, not the full file):\n" + digest.strip()
+            )
+            used_wide_fallback = True
+
+    system_prompt = build_llm_compact_knowledge_system_prompt(transcript_text or "(No knowledge yet.)")
+    logger.info("system_prompt: %s", system_prompt)
+    if parts != "summary_only" and (relevant_snippets or "").strip() and not used_wide_fallback:
+        system_prompt = system_prompt + "\n\nRelevant excerpt (for this question only):\n" + relevant_snippets.strip()
+    if extra:
+        system_prompt = system_prompt + "\n\nADDITIONAL INSTRUCTIONS:\n" + extra
+    return system_prompt
 
 
 def ensure_session_summary(session: dict[str, Any], transcript_text: str) -> dict[str, Any]:

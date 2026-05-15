@@ -36,14 +36,24 @@
     .chat-indicator.loading { color: #0ea5e9; }
     .session-indicator { font-size: 0.8rem; color: #64748b; margin-bottom: 8px; min-height: 1.2em; }
     .session-indicator.active { color: #0ea5e9; font-weight: 500; }
+    .activate-section { background: #f0fdf4; border: 1px solid #86efac; border-radius: 8px; padding: 12px; margin-bottom: 16px; }
+    .activate-section label { margin-top: 8px; }
+    .activate-section textarea { width: 100%; min-height: 80px; padding: 8px; font-family: inherit; font-size: 0.9rem; resize: vertical; }
+    .activate-section .hint { font-size: 0.8rem; color: #64748b; margin-top: 4px; }
+    .activate-section button { margin-right: 8px; margin-top: 8px; }
+    .activate-status { font-size: 0.85rem; margin-top: 8px; color: #15803d; }
+    .activate-status.error { color: #dc2626; }
   </style>
 </head>
 <body>
   <h1>Real-time Audio Streaming Test Client</h1>
-  <p style="font-size: 0.9rem; color: #64748b;">Microphone → PCM → WebSocket → transcript. Chat via /api/chat. <strong>Hindari CORS:</strong> jalankan <code>python server.py</code> di folder ini, lalu buka <code>http://localhost:8080/stream_test.html</code>.</p>
+  <p style="font-size: 0.9rem; color: #64748b;">Microphone → PCM → WebSocket → transcript. Chat via /api/chat. <strong>Hindari CORS:</strong> jalankan <code>python server.py</code> di folder ini, lalu buka <code>http://localhost:8080/stream_test.html</code>. Jika halaman dari port 8080, isi <strong>API Base URL</strong> dengan backend (e.g. <code>http://localhost:8000</code>).</p>
 
   <label for="wsUrl">WebSocket URL</label>
   <input type="text" id="wsUrl" value="ws://localhost:8000/ws/transcribe-with-assistant" placeholder="ws://localhost:8000/ws/transcribe-with-assistant" />
+
+  <label for="apiBaseUrl">API Base URL <span style="font-weight: normal; color: #64748b;">(untuk /api/chat, /api/session/activate; kosongkan jika halaman diload dari backend)</span></label>
+  <input type="text" id="apiBaseUrl" value="http://localhost:8000" placeholder="http://localhost:8000" />
 
   <button id="btnStart">Start recording</button>
   <button id="btnStop" disabled>Stop recording</button>
@@ -59,9 +69,19 @@
       <div id="history" class="history"></div>
     </div>
     <div class="split-right">
+      <section class="activate-section" aria-label="Custom Session Active">
+        <label>Custom Session Active</label>
+        <p class="hint">Aktifkan session dari file (session_id) atau dari teks transcript kustom. Setelah aktif, Chat memakai transcript ini sebagai knowledge.</p>
+        <label for="activateSessionId">Session ID <span class="hint">(kosongkan jika hanya pakai transcript kustom)</span></label>
+        <input type="text" id="activateSessionId" placeholder="e.g. c6b6cf6ff6be (load dari transcripts/{id}.txt)" />
+        <label for="activateTranscript">Transcript kustom <span class="hint">(opsional; bila hanya session_id, load dari file)</span></label>
+        <textarea id="activateTranscript" placeholder="Tempel teks transcript di sini, atau kosongkan untuk load dari file berdasarkan Session ID di atas."></textarea>
+        <button type="button" id="btnActivateSession">Aktifkan Session</button>
+        <div id="activateStatus" class="activate-status" aria-live="polite"></div>
+      </section>
       <section class="chat-section" aria-label="Chat with AI">
         <label>Chat</label>
-        <p style="font-size: 0.85rem; color: #64748b;">Percakapan dua arah. Chat memakai session dari transcript.</p>
+        <p style="font-size: 0.85rem; color: #64748b;">Percakapan dua arah. Chat memakai session dari transcript (live atau custom session active).</p>
         <div id="sessionIndicator" class="session-indicator" aria-live="polite"></div>
         <div id="chatMessages" class="chat-messages"></div>
         <div id="chatIndicator" class="chat-indicator" style="display: none;"></div>
@@ -193,6 +213,10 @@
       const btnNewSession = $("btnNewSession");
       const chatIndicatorEl = $("chatIndicator");
       const sessionIndicatorEl = $("sessionIndicator");
+      const activateSessionIdInput = $("activateSessionId");
+      const activateTranscriptInput = $("activateTranscript");
+      const btnActivateSession = $("btnActivateSession");
+      const activateStatusEl = $("activateStatus");
 
       // Transcript: kumpulan segment saat recording (untuk tampilan). Saat stop → snapshot ke rawTranscript.
       let transcriptSegments = [];
@@ -238,9 +262,12 @@
         });
       }
 
-      // Base URL untuk API. Jika halaman diload dari http(s) (bukan file://), pakai origin saat ini
-      // supaya request lewat dev-server proxy dan tidak kena CORS. Kalau file://, pakai host dari WebSocket URL.
+      // Base URL untuk API. Jika "API Base URL" diisi, pakai itu (backend di port lain, e.g. 8000).
+      // Kalau kosong dan halaman dari http(s), pakai origin. Kalau file://, turun dari WebSocket URL.
       function getApiBaseUrl() {
+        const apiInput = document.getElementById("apiBaseUrl");
+        const explicit = (apiInput && apiInput.value || "").trim();
+        if (explicit) return explicit.replace(/\/+$/, "");
         if (typeof location !== "undefined" && location.origin && location.origin !== "null")
           return location.origin;
         const url = (wsUrlInput && wsUrlInput.value || "").trim();
@@ -370,6 +397,8 @@
               }
               if (obj.type === "session") {
                 // Hanya session_id sudah disimpan di atas; tidak perlu aksi lain.
+              } else if (obj.type === "assistant_processing") {
+                setChatIndicator((obj.message || "Menunggu respons…") + "", true);
               } else if (obj.type === "partial") {
                 liveEl.textContent = obj.text || "";
                 if (!liveEl.textContent) liveEl.innerHTML = "<em>—</em>";
@@ -382,6 +411,7 @@
                   renderTranscriptHistory();
                 }
               } else if (obj.type === "assistant_reply") {
+                setChatIndicator("", false);
                 const replyText = (obj.text || "").trim();
                 if (replyText) appendChatMessage("assistant", replyText);
                 if (obj.trigger_audio && obj.audio) {
@@ -520,6 +550,11 @@
           appendChatMessage("assistant", "Error: URL API tidak tersedia. Set WebSocket URL.");
           return;
         }
+        if (!currentSessionId) {
+          setChatIndicator("", false);
+          appendChatMessage("assistant", "Belum ada session. Start recording atau gunakan Custom Session Active (isi Session ID atau transcript lalu Aktifkan Session).");
+          return;
+        }
 
         fetch(url, {
           method: "POST",
@@ -555,6 +590,57 @@
         updateSessionIndicator();
         if (chatMessagesEl) chatMessagesEl.innerHTML = "";
         setChatIndicator("", false);
+      });
+
+      // Custom Session Active: POST /api/session/activate lalu pakai session_id untuk chat.
+      function clearActivateStatus() {
+        if (activateStatusEl) { activateStatusEl.textContent = ""; activateStatusEl.className = "activate-status"; }
+      }
+      btnActivateSession.addEventListener("click", () => {
+        const sid = (activateSessionIdInput && activateSessionIdInput.value || "").trim() || null;
+        const transcript = (activateTranscriptInput && activateTranscriptInput.value || "").trim() || null;
+        if (!sid && !transcript) {
+          if (activateStatusEl) {
+            activateStatusEl.textContent = "Isi Session ID (untuk load dari file) atau Transcript kustom.";
+            activateStatusEl.className = "activate-status error";
+          }
+          return;
+        }
+        clearActivateStatus();
+        if (activateStatusEl) activateStatusEl.textContent = "Mengaktifkan…";
+        const base = getApiBaseUrl();
+        const url = base ? base + "/api/session/activate" : "";
+        if (!url) {
+          if (activateStatusEl) { activateStatusEl.textContent = "Error: URL API tidak tersedia. Set WebSocket URL."; activateStatusEl.className = "activate-status error"; }
+          return;
+        }
+        const payload = {};
+        if (sid) payload.session_id = sid;
+        if (transcript) payload.transcript = transcript;
+        fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        })
+          .then((res) => {
+            if (!res.ok) throw new Error(res.statusText || res.status);
+            return res.json();
+          })
+          .then((data) => {
+            currentSessionId = data.session_id;
+            hasEverReceivedSession = true;
+            updateSessionIndicator();
+            if (activateStatusEl) {
+              activateStatusEl.textContent = "Session aktif: " + data.session_id + " (" + (data.transcript_length || 0) + " karakter). Siap chat.";
+              activateStatusEl.className = "activate-status";
+            }
+          })
+          .catch((err) => {
+            if (activateStatusEl) {
+              activateStatusEl.textContent = "Gagal: " + (err.message || "Coba lagi.");
+              activateStatusEl.className = "activate-status error";
+            }
+          });
       });
 
       btnStart.addEventListener("click", startRecording);

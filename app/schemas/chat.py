@@ -34,6 +34,25 @@ class ChatRequest(BaseModel):
     )
 
 
+class ActivateSessionRequest(BaseModel):
+    """Request untuk mengaktifkan session dengan transcript (dari file atau teks kustom). Setelah aktif, POST /api/chat dengan session_id ini siap dipanggil."""
+
+    session_id: str | None = Field(
+        None,
+        description="ID session: bila hanya ini yang dikirim, transcript di-load dari transcripts/{session_id}.txt",
+    )
+    transcript: str | None = Field(
+        None,
+        description="Teks transcript kustom. Bila dikirim bersama session_id, session tersebut diisi transcript ini; bila hanya transcript, session_id baru digenerate.",
+    )
+
+
+class ActivateSessionResponse(BaseModel):
+    session_id: str = Field(..., description="ID session yang aktif; gunakan untuk POST /api/chat")
+    transcript_length: int = Field(0, description="Jumlah karakter transcript yang dipakai")
+    summary_ready: bool = Field(True, description="Summary sudah dibangun dan siap untuk chat")
+
+
 class ChatResponse(BaseModel):
     """Response body for POST /api/chat. session_id + text (assistant reply); audio for TTS when available."""
 

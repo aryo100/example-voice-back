@@ -87,6 +87,31 @@ def update_session_transcript(
     s["transcript_finalized"] = transcript_finalized
 
 
+def create_or_update_session_transcript(session_id: str, transcript_text: str) -> dict[str, Any]:
+    """
+    Buat atau update session dengan transcript yang diberikan (untuk custom Session active).
+    Summary fields dikosongkan; caller biasanya akan memanggil summarize dan set_session.
+    Returns the session dict.
+    """
+    text = (transcript_text or "").strip()
+    if session_id in _session_store:
+        s = _session_store[session_id]
+        s["transcript_text"] = text
+        s["transcript_finalized"] = True
+        s["global_summary"] = ""
+        s["segment_summaries"] = []
+        s["compressed_rolling_summary"] = ""
+        s["transcript_summary_hash"] = ""
+        return s
+    _session_store[session_id] = {
+        "messages": [],
+        "transcript_text": text,
+        "transcript_finalized": True,
+        "created_at": time.time(),
+    }
+    return _session_store[session_id]
+
+
 def session_store() -> dict[str, dict[str, Any]]:
     """Return the underlying store (read-only view for debugging)."""
     return _session_store

@@ -12,9 +12,8 @@ import os
 import re
 from typing import Any
 
-import httpx
-
-from app.config import Settings, get_settings
+from app.config import get_settings
+from app.services.llm_provider import completion as llm_completion
 from app.schemas.refine import (
     RefineRequest,
     RefineResponse,
@@ -152,64 +151,32 @@ def _parse_segments(
     return out
 
 
-def _get_cloudflare_refine_auth(settings: Settings) -> tuple[str, str]:
-    """Return (account_id, token) for Workers AI. Same as ASR: CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_TOKEN."""
-    account_id = (getattr(settings, "CLOUDFLARE_ACCOUNT_ID", "") or "").strip()
-    token = (getattr(settings, "CLOUDFLARE_API_TOKEN", "") or "").strip()
-    return account_id, token
-
-
 async def refine_transcript_with_chat(req: RefineRequest) -> RefineResponse:
     """
-    Call Cloudflare Workers AI to refine transcript segments. Returns structured per-segment result.
-    No OpenAI/GPT; uses Workers AI REST API (free tier).
-    Raises ValueError if chat is disabled or auth missing; httpx.HTTPStatusError on API errors.
+    Call LLM (OpenRouter → Cloudflare → Hugging Face) to refine transcript segments.
+    Returns structured per-segment result. Raises ValueError if chat is disabled or all providers fail.
     """
     settings = get_settings()
     if not getattr(settings, "REFINE_CHAT_ENABLED", True):
         raise ValueError("Refine chat is disabled (REFINE_CHAT_ENABLED=false)")
 
-    account_id, token = _get_cloudflare_refine_auth(settings)
-    if not account_id or not token:
-        raise ValueError("CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN are required for refine")
-
-    model = getattr(settings, "REFINE_CF_MODEL", "@cf/meta/llama-3.1-8b-instruct")
-    max_tokens = getattr(settings, "REFINE_CHAT_MAX_TOKENS", 2048)
-
     user_message = _build_user_message(req)
     if not req.segments:
         return RefineResponse(segments=[])
 
-    url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{model}"
-    payload = {
-        "messages": [
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": user_message},
-        ],
-        "max_tokens": max_tokens,
-        "temperature": 0.2,
-    }
+    messages = [
+        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "user", "content": user_message},
+    ]
+    max_tokens = getattr(settings, "REFINE_CHAT_MAX_TOKENS", 2048)
+    try:
+        content = await llm_completion(messages, max_tokens=max_tokens, temperature=0.2)
+    except ValueError as e:
+        raise ValueError("Refine failed: no LLM provider available. Set OPENROUTER_API_KEY, CLOUDFLARE_*, or HUGGINGFACE_API_KEY.") from e
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(
-            url,
-            json=payload,
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        )
-        resp.raise_for_status()
-        data = resp.json()
-
-    # Workers AI returns { "result": { "response": "..." } } or direct { "response": "..." }
-    result = data.get("result", data)
-    if isinstance(result, dict):
-        content = result.get("response", "") or ""
-    elif isinstance(result, str):
-        content = result
-    else:
-        content = ""
     content = (content or "").strip()
     if not content:
-        raise ValueError("Cloudflare Workers AI returned empty response")
+        raise ValueError("LLM returned empty response")
 
     try:
         raw_list = _extract_json_array(content)
@@ -320,37 +287,19 @@ async def classify_need_refine(user_message: str, transcript_text: str) -> bool:
     """
     Ask LLM whether the user is providing facts/context to correct the transcript.
     Returns True only if we should run refine (user gives factual context to fix transcript).
+    Uses LLM provider priority (OpenRouter → Cloudflare → Hugging Face).
     """
     if not (user_message or "").strip():
         return False
     transcript_snippet = (transcript_text or "").strip()[:2000]
     user_content = f"User message: {user_message.strip()}\n\nTranscript (excerpt):\n{transcript_snippet or '(empty)'}\n\nAnswer (YES or NO):"
-    settings = get_settings()
-    account_id, token = _get_cloudflare_refine_auth(settings)
-    if not account_id or not token:
-        return False
-    model = getattr(settings, "REFINE_CF_MODEL", "@cf/meta/llama-3.1-8b-instruct")
-    url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{model}"
-    payload = {
-        "messages": [
-            {"role": "system", "content": _CLASSIFY_NEED_REFINE_PROMPT},
-            {"role": "user", "content": user_content},
-        ],
-        "max_tokens": 10,
-        "temperature": 0.0,
-    }
+    messages = [
+        {"role": "system", "content": _CLASSIFY_NEED_REFINE_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(
-                url,
-                json=payload,
-                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        result = data.get("result", data)
-        content = (result.get("response", "") if isinstance(result, dict) else (result if isinstance(result, str) else "")) or ""
-        return "yes" in content.strip().lower()
+        content = await llm_completion(messages, max_tokens=10, temperature=0.0, timeout=15.0)
+        return "yes" in (content or "").strip().lower()
     except Exception as e:
         logger.warning("Classify need_refine failed: %s", e)
         return False
@@ -369,108 +318,49 @@ async def refine_raw_transcript(transcript: str, user_question: str) -> str:
     return "\n".join(s.refined_text for s in response.segments if s.refined_text)
 
 
-def _log_chat_request(model: str, max_tokens: int, messages: list[dict[str, str]], max_content_len: int = 2000) -> None:
-    """Log payload sent to Cloudflare LLM (content truncated for readability)."""
-    logger.info(
-        "LLM request to Cloudflare: model=%s, max_tokens=%s, messages=%s",
-        model, max_tokens, len(messages),
-    )
+def _log_chat_request(max_tokens: int, messages: list[dict[str, str]], max_content_len: int = 2000) -> None:
+    """Log payload sent to LLM (content truncated for readability)."""
+    logger.info("LLM request: max_tokens=%s, messages=%s", max_tokens, len(messages))
     for i, msg in enumerate(messages):
         role = msg.get("role", "?")
         content = (msg.get("content") or "").strip()
         length = len(content)
-        display = content if length <= max_content_len else content[:max_content_len] + f"\n... [truncated, total {length} chars]"
+        # dont truncate content but not remove this line, just comment it out
+        # display = content if length <= max_content_len else content[:max_content_len] + f"\n... [truncated, total {length} chars]"
+        display = content
         logger.info("  [%s] role=%s len=%s:\n%s", i, role, length, display)
 
 
 async def chat_with_ai_messages(messages: list[dict[str, str]]) -> str:
     """
-    Call Cloudflare Workers AI with full message history. Returns assistant reply only.
+    Call LLM (OpenRouter → Cloudflare → Hugging Face) with full message history. Returns assistant reply only.
     messages = [ { "role": "system"|"user"|"assistant", "content": "..." }, ... ]
     """
     settings = get_settings()
     if not getattr(settings, "REFINE_CHAT_ENABLED", True):
         raise ValueError("Chat is disabled (REFINE_CHAT_ENABLED=false)")
 
-    account_id, token = _get_cloudflare_refine_auth(settings)
-    if not account_id or not token:
-        raise ValueError("CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN are required for chat")
-
-    model = getattr(settings, "REFINE_CF_MODEL", "@cf/meta/llama-3.1-8b-instruct")
     max_tokens = getattr(settings, "REFINE_CHAT_MAX_TOKENS", 2048)
-
-    url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{model}"
-    payload = {
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "temperature": 0.4,
-    }
-
-    _log_chat_request(model, max_tokens, messages)
-
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(
-            url,
-            json=payload,
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        )
-        resp.raise_for_status()
-        data = resp.json()
-
-    result = data.get("result", data)
-    if isinstance(result, dict):
-        content = result.get("response", "") or ""
-    elif isinstance(result, str):
-        content = result
-    else:
-        content = ""
-    return (content or "").strip()
+    # _log_chat_request(max_tokens, messages)
+    return await llm_completion(messages, max_tokens=max_tokens, temperature=0.4)
 
 
 async def chat_with_ai(message: str, transcript_context: str | None = None) -> str:
     """
-    Call Cloudflare Workers AI in CHAT MODE. Returns plain conversational reply.
-    Does NOT refine or modify transcript. Raises ValueError if disabled/auth missing.
+    Call LLM (OpenRouter → Cloudflare → Hugging Face) in CHAT MODE. Returns plain conversational reply.
+    Does NOT refine or modify transcript. Raises ValueError if disabled or all providers fail.
     """
     settings = get_settings()
     if not getattr(settings, "REFINE_CHAT_ENABLED", True):
         raise ValueError("Chat is disabled (REFINE_CHAT_ENABLED=false)")
 
-    account_id, token = _get_cloudflare_refine_auth(settings)
-    if not account_id or not token:
-        raise ValueError("CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN are required for chat")
-
-    model = getattr(settings, "REFINE_CF_MODEL", "@cf/meta/llama-3.1-8b-instruct")
-    max_tokens = getattr(settings, "REFINE_CHAT_MAX_TOKENS", 2048)
-
     user_content = message
     if transcript_context:
         user_content = f"Transcript (read-only, do not modify):\n{transcript_context}\n\nUser message: {message}"
 
-    url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{model}"
-    payload = {
-        "messages": [
-            {"role": "system", "content": _CHAT_SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
-        ],
-        "max_tokens": max_tokens,
-        "temperature": 0.4,
-    }
-
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(
-            url,
-            json=payload,
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        )
-        resp.raise_for_status()
-        data = resp.json()
-
-    result = data.get("result", data)
-    if isinstance(result, dict):
-        content = result.get("response", "") or ""
-    elif isinstance(result, str):
-        content = result
-    else:
-        content = ""
-    return (content or "").strip()
+    messages = [
+        {"role": "system", "content": _CHAT_SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
+    max_tokens = getattr(settings, "REFINE_CHAT_MAX_TOKENS", 2048)
+    return await llm_completion(messages, max_tokens=max_tokens, temperature=0.4)

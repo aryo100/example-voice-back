@@ -7,6 +7,7 @@ Client sends binary PCM 16-bit mono 16kHz. Server responds with JSON:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -15,15 +16,29 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 
-from app.config import get_settings
+from app.config import (
+    get_settings,
+    chat_knowledge_multi_system,
+    chat_llm_compact_context_parts,
+    chat_llm_compact_knowledge,
+    chat_use_only_relevant_snippet,
+)
 from app.asr.base import ASREngine
 from app.asr.local_whisper import LocalWhisperEngine
 from app.asr.cloudflare import CloudflareWhisperEngine
 from app.websocket_manager import WebSocketManager, WebSocketManagerWithAssistant
 from app.schemas.refine import RefineRequest, RefineResponse
-from app.schemas.chat import ChatRequest, ChatResponse
-from app.session_store import get_session, set_session, delete_session, ensure_session_from_transcript_file
+from app.schemas.chat import ActivateSessionRequest, ActivateSessionResponse, ChatRequest, ChatResponse
+from app.session_store import (
+    get_session,
+    set_session,
+    delete_session,
+    ensure_session_from_transcript_file,
+    create_or_update_session_transcript,
+    generate_session_id,
+)
 from app.services.refine_service import (
     refine_transcript_with_chat,
     chat_with_ai_messages,
@@ -36,6 +51,10 @@ from app.services.chat_context import (
     select_relevant_snippets,
     build_chat_system_prompt,
     build_chat_system_prompt_for_tts,
+    build_chat_system_prompt_llm_compact,
+    build_chat_knowledge_base_system_prompt,
+    build_transcript_knowledge_system_messages,
+    summary_field_invalid_for_llm,
     _transcript_hash,
 )
 
@@ -181,6 +200,15 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# CORS: agar frontend di port lain (e.g. localhost:8080) bisa POST /api/chat, /api/session/activate (OPTIONS preflight → 200)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "OPTIONS"],
+    allow_headers=["*"],
+)
+
 
 @app.websocket("/ws/transcribe")
 async def websocket_transcribe(websocket: WebSocket) -> None:
@@ -246,6 +274,83 @@ def _save_refinement_layer(session_id: str, response: RefineResponse) -> None:
 
 
 
+@app.post("/api/session/activate", response_model=ActivateSessionResponse)
+async def activate_session(request: ActivateSessionRequest) -> ActivateSessionResponse:
+    """
+    Aktifkan session dengan transcript dari file atau teks kustom. Setelah ini, POST /api/chat dengan
+    session_id yang dikembalikan siap dipanggil (transcript jadi knowledge untuk asisten).
+    - Hanya session_id: load transcript dari transcripts/{session_id}.txt
+    - Hanya transcript: buat session_id baru, isi transcript tersebut
+    - session_id + transcript: pakai session_id itu, isi dengan transcript (override file)
+    """
+    session_id = (request.session_id or "").strip() or None
+    transcript_body = (request.transcript or "").strip() or None
+
+    if not session_id and not transcript_body:
+        raise HTTPException(
+            status_code=400,
+            detail="Berikan session_id (untuk load dari file transcripts/{session_id}.txt) atau transcript (teks kustom), atau keduanya.",
+        )
+
+    if transcript_body:
+        # Teks kustom: pakai session_id yang diberikan atau generate baru
+        sid = session_id or generate_session_id()
+        create_or_update_session_transcript(sid, transcript_body)
+        transcript_text = transcript_body
+    else:
+        # Load dari file
+        if not session_id:
+            raise HTTPException(status_code=400, detail="session_id diperlukan bila transcript tidak dikirim")
+        transcript_text = get_transcript_context_for_chat(session_id)
+        if not (transcript_text or "").strip():
+            raise HTTPException(
+                status_code=404,
+                detail=f"Transcript tidak ditemukan untuk session_id={session_id}. Pastikan file transcripts/{session_id}.txt ada.",
+            )
+        ensure_session_from_transcript_file(session_id, transcript_text)
+        sid = session_id
+
+    session = get_session(sid)
+    if not session:
+        raise HTTPException(status_code=500, detail="Session tidak terbentuk")
+    transcript_text = session.get("transcript_text") or ""
+    current_hash = _transcript_hash(transcript_text)
+    need_summary = (session.get("transcript_summary_hash") or "") != current_hash or summary_field_invalid_for_llm(
+        session.get("global_summary")
+    )
+    summary_ready = True
+    if need_summary and transcript_text.strip():
+        try:
+            summary_result = await summarize_transcript_for_chat(transcript_text, activate=True)
+            session["global_summary"] = summary_result.get("global_summary", "")
+            session["segment_summaries"] = summary_result.get("segment_summaries", [])
+            session["compressed_rolling_summary"] = summary_result.get("compressed_rolling_summary", "")
+            session["transcript_summary_hash"] = current_hash
+            set_session(sid, session)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("Summary compute failed on activate: %s", e)
+            session["global_summary"] = "(Transcript summary unavailable.)"
+            session["segment_summaries"] = []
+            session["compressed_rolling_summary"] = ""
+            session["transcript_summary_hash"] = current_hash
+            set_session(sid, session)
+            summary_ready = False
+    elif need_summary:
+        session["global_summary"] = "(No transcript yet.)"
+        session["segment_summaries"] = []
+        session["compressed_rolling_summary"] = ""
+        session["transcript_summary_hash"] = current_hash
+        set_session(sid, session)
+
+    return ActivateSessionResponse(
+        session_id=sid,
+        transcript_length=len(transcript_text),
+        summary_ready=summary_ready,
+    )
+
+
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest) -> ChatResponse:
     """
@@ -286,51 +391,114 @@ async def chat(request: ChatRequest) -> ChatResponse:
     transcript_text = session.get("transcript_text") or ""
     current_hash = _transcript_hash(transcript_text)
     stored_hash = session.get("transcript_summary_hash") or ""
-    need_summary = stored_hash != current_hash or not (session.get("global_summary") or "").strip()
+    need_summary = stored_hash != current_hash or summary_field_invalid_for_llm(session.get("global_summary"))
 
-    if need_summary and transcript_text.strip():
+    use_llm_compact = chat_llm_compact_knowledge()
+    compact_parts = chat_llm_compact_context_parts()
+    use_multi_system = chat_knowledge_multi_system()
+    skip_heavy_summary = use_llm_compact and compact_parts == "excerpt_only" and not use_multi_system
+
+    if need_summary and transcript_text.strip() and not skip_heavy_summary and not use_multi_system:
         try:
             summary_result = await summarize_transcript_for_chat(transcript_text)
             session["global_summary"] = summary_result.get("global_summary", "")
             session["segment_summaries"] = summary_result.get("segment_summaries", [])
             session["compressed_rolling_summary"] = summary_result.get("compressed_rolling_summary", "")
             session["transcript_summary_hash"] = current_hash
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.warning("Summary compute failed: %s; using fallback", e)
             session["global_summary"] = "(Transcript summary unavailable.)"
             session["segment_summaries"] = []
             session["compressed_rolling_summary"] = ""
             session["transcript_summary_hash"] = current_hash
-    elif need_summary:
+    elif need_summary and not transcript_text.strip():
         session["global_summary"] = "(No transcript yet.)"
         session["segment_summaries"] = []
         session["compressed_rolling_summary"] = ""
         session["transcript_summary_hash"] = current_hash
+    elif need_summary and transcript_text.strip() and (skip_heavy_summary or use_multi_system):
+        session["transcript_summary_hash"] = current_hash
 
     # transcript_raw = session transcript_text (full); transcript_summary = compressed context for LLM only
-    global_summary = session.get("global_summary") or "(No transcript yet.)"
-    compressed_rolling = session.get("compressed_rolling_summary") or ""
-    transcript_summary = global_summary.strip()
-    if compressed_rolling.strip():
-        transcript_summary = transcript_summary + "\n\n" + compressed_rolling.strip()
-    # Optional: add relevant snippet for this message (keeps context compact)
-    snippet_max = getattr(get_settings(), "CHAT_SNIPPET_MAX_CHARS", 600)
+    settings = get_settings()
+    use_only_relevant = chat_use_only_relevant_snippet()
+    full_snippet_max = getattr(settings, "CHAT_ONLY_RELEVANT_SNIPPET_MAX_CHARS", 50000)
+    snippet_max = getattr(settings, "CHAT_SNIPPET_MAX_CHARS", 600)
     relevant_snippets = select_relevant_snippets(transcript_text, message, max_chars=snippet_max)
-    system_prompt = build_chat_system_prompt_for_tts(transcript_summary)
-    # If we have snippets for this question, append to system so model can reference details
-    if relevant_snippets.strip():
-        system_prompt = system_prompt + "\n\nRelevant excerpt (for this question only):\n" + relevant_snippets.strip()
+    extra_llm = (getattr(settings, "CHAT_LLM_EXTRA_SYSTEM_PROMPT", "") or "").strip()
+    effective_parts = compact_parts if use_llm_compact else "both"
+    logger.info(
+        "CHAT_USE_ONLY_RELEVANT_SNIPPET=%s use_only_relevant=%s CHAT_LLM_COMPACT_KNOWLEDGE=%s CHAT_LLM_COMPACT_CONTEXT_PARTS=%s CHAT_KNOWLEDGE_MULTI_SYSTEM=%s",
+        getattr(settings, "CHAT_USE_ONLY_RELEVANT_SNIPPET", None),
+        use_only_relevant,
+        use_llm_compact,
+        effective_parts,
+        use_multi_system,
+    )
+
+    if use_multi_system:
+        base_system = build_chat_knowledge_base_system_prompt(extra_llm)
+        lines_per = int(getattr(settings, "CHAT_KNOWLEDGE_CHUNK_LINES", 50) or 50)
+        max_ch = int(getattr(settings, "CHAT_KNOWLEDGE_MAX_CHUNKS", 40) or 40)
+        max_cpc = int(getattr(settings, "CHAT_KNOWLEDGE_MAX_CHARS_PER_CHUNK", 12000) or 12000)
+        knowledge_msgs = build_transcript_knowledge_system_messages(
+            transcript_text,
+            lines_per_chunk=max(1, lines_per),
+            max_chunks=max(1, max_ch),
+            max_chars_per_chunk=max(500, max_cpc),
+        )
+        logger.info(
+            "CHAT context: multi-system knowledge, base_chars=%d transcript_chunks=%d",
+            len(base_system),
+            len(knowledge_msgs),
+        )
+    elif use_llm_compact or not use_only_relevant:
+        global_summary = session.get("global_summary") or "(No transcript yet.)"
+        compressed_rolling = session.get("compressed_rolling_summary") or ""
+        system_prompt = build_chat_system_prompt_llm_compact(
+            parts=effective_parts,
+            global_summary=global_summary,
+            compressed_rolling=compressed_rolling,
+            relevant_snippets=relevant_snippets,
+            extra_instructions=extra_llm,
+            transcript_text=transcript_text,
+            user_question=message,
+            knowledge_omit_summary=use_llm_compact,
+        )
+        logger.info(
+            "CHAT context: LLM compact knowledge, compact=%s parts=%s prompt_chars=%d",
+            use_llm_compact,
+            effective_parts,
+            len(system_prompt),
+        )
+    else:
+        # Konteks LLM = full transcript (sampai full_snippet_max chars); berat untuk provider dengan batas payload.
+        context_for_prompt = (transcript_text or "").strip()
+        if len(context_for_prompt) > full_snippet_max:
+            context_for_prompt = context_for_prompt[:full_snippet_max] + "\n[... truncated ...]"
+        context_for_prompt = context_for_prompt or "(Tidak ada transcript.)"
+        system_prompt = build_chat_system_prompt_for_tts(context_for_prompt)
+        logger.info("CHAT context: only_relevant_snippet=true (full transcript to LLM), context_chars=%d", len(context_for_prompt))
 
     chat_history = list(session.get("messages", []))
-    settings = get_settings()
     max_history = getattr(settings, "CHAT_HISTORY_MAX_MESSAGES", 20)
     if len(chat_history) > max_history:
         chat_history = chat_history[-max_history:]
-    messages_for_llm = [
-        {"role": "system", "content": system_prompt},
-        *chat_history,
-        {"role": "user", "content": message},
-    ]
+    if use_multi_system:
+        messages_for_llm = [
+            {"role": "system", "content": base_system},
+            *knowledge_msgs,
+            *chat_history,
+            {"role": "user", "content": message},
+        ]
+    else:
+        messages_for_llm = [
+            {"role": "system", "content": system_prompt},
+            *chat_history,
+            {"role": "user", "content": message},
+        ]
     try:
         reply = await chat_with_ai_messages(messages_for_llm)
     except ValueError as e:

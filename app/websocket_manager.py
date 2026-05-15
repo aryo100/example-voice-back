@@ -31,7 +31,13 @@ from app.audio import (
     create_audio_recorder,
 )
 from app.asr.base import ASREngine
-from app.config import get_settings
+from app.config import (
+    get_settings,
+    chat_knowledge_multi_system,
+    chat_llm_compact_context_parts,
+    chat_llm_compact_knowledge,
+    chat_use_only_relevant_snippet,
+)
 from app.session_store import ensure_session_for_websocket, get_session, set_session, update_session_transcript
 from app.tts.service import synthesize_speech
 from app.transcript.merger import TranscriptMessage
@@ -523,6 +529,11 @@ class WebSocketManagerWithAssistant(WebSocketManager):
             from app.services.chat_context import (
                 summarize_transcript_for_chat,
                 build_chat_system_prompt_for_tts,
+                build_chat_system_prompt_llm_compact,
+                build_chat_knowledge_base_system_prompt,
+                build_transcript_knowledge_system_messages,
+                select_relevant_snippets,
+                summary_field_invalid_for_llm,
                 _transcript_hash,
             )
             from app.services.refine_service import chat_with_ai_messages
@@ -531,29 +542,91 @@ class WebSocketManagerWithAssistant(WebSocketManager):
             if not session:
                 return
             transcript_text = session.get("transcript_text") or ""
-            current_hash = _transcript_hash(transcript_text)
-            stored_hash = session.get("transcript_summary_hash") or ""
-            need_summary = stored_hash != current_hash or not (session.get("global_summary") or "").strip()
-            if need_summary and transcript_text.strip():
-                try:
-                    summary_result = await summarize_transcript_for_chat(transcript_text)
-                    session["global_summary"] = summary_result.get("global_summary", "")
-                    session["segment_summaries"] = summary_result.get("segment_summaries", [])
-                    session["compressed_rolling_summary"] = summary_result.get("compressed_rolling_summary", "")
-                    session["transcript_summary_hash"] = current_hash
-                    set_session(self._session_id, session)
-                except Exception:
-                    pass
-            global_summary = session.get("global_summary") or "(No transcript yet.)"
-            compressed_rolling = session.get("compressed_rolling_summary") or ""
-            transcript_summary = global_summary.strip()
-            if compressed_rolling.strip():
-                transcript_summary = transcript_summary + "\n\n" + compressed_rolling.strip()
-            system_prompt = build_chat_system_prompt_for_tts(transcript_summary)
-            messages_for_llm = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message.strip()},
-            ]
+            settings = get_settings()
+            use_only_relevant = chat_use_only_relevant_snippet()
+            use_llm_compact = chat_llm_compact_knowledge()
+            use_multi_system = chat_knowledge_multi_system()
+            compact_parts = chat_llm_compact_context_parts()
+            skip_heavy_summary = use_llm_compact and compact_parts == "excerpt_only" and not use_multi_system
+            effective_parts = compact_parts if use_llm_compact else "both"
+            full_snippet_max = getattr(settings, "CHAT_ONLY_RELEVANT_SNIPPET_MAX_CHARS", 50000)
+            snippet_max = getattr(settings, "CHAT_SNIPPET_MAX_CHARS", 600)
+            relevant_snippets = select_relevant_snippets(transcript_text, user_message.strip(), max_chars=snippet_max)
+            extra_llm = (getattr(settings, "CHAT_LLM_EXTRA_SYSTEM_PROMPT", "") or "").strip()
+            logger.info(
+                "CHAT (WS) use_only_relevant=%s CHAT_LLM_COMPACT_KNOWLEDGE=%s parts=%s multi_system=%s",
+                use_only_relevant,
+                use_llm_compact,
+                effective_parts,
+                use_multi_system,
+            )
+
+            if use_multi_system:
+                base_system = build_chat_knowledge_base_system_prompt(extra_llm)
+                lines_per = int(getattr(settings, "CHAT_KNOWLEDGE_CHUNK_LINES", 50) or 50)
+                max_ch = int(getattr(settings, "CHAT_KNOWLEDGE_MAX_CHUNKS", 40) or 40)
+                max_cpc = int(getattr(settings, "CHAT_KNOWLEDGE_MAX_CHARS_PER_CHUNK", 12000) or 12000)
+                knowledge_msgs = build_transcript_knowledge_system_messages(
+                    transcript_text,
+                    lines_per_chunk=max(1, lines_per),
+                    max_chunks=max(1, max_ch),
+                    max_chars_per_chunk=max(500, max_cpc),
+                )
+                messages_for_llm = [
+                    {"role": "system", "content": base_system},
+                    *knowledge_msgs,
+                    {"role": "user", "content": user_message.strip()},
+                ]
+                logger.info(
+                    "CHAT context (WS): multi-system knowledge, transcript_chunks=%d",
+                    len(knowledge_msgs),
+                )
+            elif use_llm_compact or not use_only_relevant:
+                current_hash = _transcript_hash(transcript_text)
+                stored_hash = session.get("transcript_summary_hash") or ""
+                need_summary = stored_hash != current_hash or summary_field_invalid_for_llm(session.get("global_summary"))
+                if need_summary and transcript_text.strip():
+                    try:
+                        summary_result = await summarize_transcript_for_chat(transcript_text)
+                        session["global_summary"] = summary_result.get("global_summary", "")
+                        session["segment_summaries"] = summary_result.get("segment_summaries", [])
+                        session["compressed_rolling_summary"] = summary_result.get("compressed_rolling_summary", "")
+                        session["transcript_summary_hash"] = current_hash
+                        set_session(self._session_id, session)
+                    except Exception:
+                        pass
+                global_summary = session.get("global_summary") or "(No transcript yet.)"
+                compressed_rolling = session.get("compressed_rolling_summary") or ""
+                system_prompt = build_chat_system_prompt_llm_compact(
+                    parts=effective_parts,
+                    global_summary=global_summary,
+                    compressed_rolling=compressed_rolling,
+                    relevant_snippets=relevant_snippets,
+                    extra_instructions=extra_llm,
+                    transcript_text=transcript_text,
+                    user_question=user_message.strip(),
+                    knowledge_omit_summary=use_llm_compact,
+                )
+                logger.info(
+                    "CHAT context (WS): LLM compact knowledge, parts=%s prompt_chars=%d",
+                    effective_parts,
+                    len(system_prompt),
+                )
+                messages_for_llm = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_message.strip()},
+                ]
+            else:
+                context_for_prompt = (transcript_text or "").strip()
+                if len(context_for_prompt) > full_snippet_max:
+                    context_for_prompt = context_for_prompt[:full_snippet_max] + "\n[... truncated ...]"
+                context_for_prompt = context_for_prompt or "(Tidak ada transcript.)"
+                system_prompt = build_chat_system_prompt_for_tts(context_for_prompt)
+                logger.info("CHAT context (WS): full transcript to LLM, context_chars=%d", len(context_for_prompt))
+                messages_for_llm = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_message.strip()},
+                ]
             reply = await chat_with_ai_messages(messages_for_llm)
             if self._closed:
                 return
