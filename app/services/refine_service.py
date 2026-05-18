@@ -208,57 +208,44 @@ def _transcript_dir() -> str:
     return getattr(get_settings(), "TRANSCRIPT_DIR", "./transcripts")
 
 
-def session_already_refined(session_id: str) -> bool:
-    """True if this session has already been refined (refinements file exists)."""
+async def session_already_refined(session_id: str) -> bool:
+    """True if this session has already been refined."""
     if not session_id:
         return False
-    path = os.path.join(_transcript_dir(), f"{session_id}_refinements.json")
-    return os.path.isfile(path)
+    from app.transcript.storage import session_has_refinements
+
+    return await session_has_refinements(session_id)
 
 
-def load_transcript_segments(session_id: str) -> list[RefineSegmentInput]:
-    """Load transcript from transcripts/{session_id}.txt and return segments (one per non-empty line)."""
-    path = os.path.join(_transcript_dir(), f"{session_id}.txt")
+async def load_transcript_segments(session_id: str) -> list[RefineSegmentInput]:
+    """Load transcript lines as segments."""
+    from app.transcript.storage import get_transcript_content
+
     segments: list[RefineSegmentInput] = []
-    try:
-        if not os.path.isfile(path):
-            return segments
-        with open(path, "r", encoding="utf-8") as f:
-            for i, line in enumerate(f):
-                text = line.strip()
-                if not text:
-                    continue
-                segments.append(
-                    RefineSegmentInput(
-                        segment_id=str(i),
-                        text=text,
-                        start_sec=0.0,
-                        end_sec=0.0,
-                        confidence=0.5,
-                    )
-                )
-    except OSError as e:
-        logger.warning("Could not load transcript %s: %s", path, e)
+    content = await get_transcript_content(session_id)
+    if not content:
+        return segments
+    for i, line in enumerate(content.splitlines()):
+        text = line.strip()
+        if not text:
+            continue
+        segments.append(
+            RefineSegmentInput(
+                segment_id=str(i),
+                text=text,
+                start_sec=0.0,
+                end_sec=0.0,
+                confidence=0.5,
+            )
+        )
     return segments
 
 
-def get_transcript_context_for_chat(session_id: str) -> str | None:
-    """Build read-only transcript context for CHAT MODE: prefer refined text, else raw transcript."""
-    ref_path = os.path.join(_transcript_dir(), f"{session_id}_refinements.json")
-    raw_path = os.path.join(_transcript_dir(), f"{session_id}.txt")
-    try:
-        if os.path.isfile(ref_path):
-            with open(ref_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, list):
-                lines = [item.get("refined_text", item.get("original_text", "")) for item in data if isinstance(item, dict)]
-                return "\n".join(lines) if lines else None
-        if os.path.isfile(raw_path):
-            with open(raw_path, "r", encoding="utf-8") as f:
-                return f.read().strip() or None
-    except (OSError, json.JSONDecodeError) as e:
-        logger.warning("Could not load transcript context for %s: %s", session_id, e)
-    return None
+async def get_transcript_context_for_chat(session_id: str) -> str | None:
+    """Build read-only transcript context for CHAT MODE."""
+    from app.transcript.storage import build_chat_transcript_context
+
+    return await build_chat_transcript_context(session_id)
 
 
 def _transcript_text_to_segments(transcript: str) -> list[RefineSegmentInput]:

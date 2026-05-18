@@ -24,3 +24,6 @@ edge-tts>=7.2.7
 
 # Config
 pydantic-settings>=2.1.0
+
+# Transcript storage (when TRANSCRIPT_STORAGE=mongodb or USE_DATABASE=true)
+motor>=3.3.0

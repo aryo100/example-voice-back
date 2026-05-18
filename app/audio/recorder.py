@@ -9,8 +9,10 @@ AudioRecorder: optional per-session recording of WebSocket audio to WAV/MP3.
 """
 from __future__ import annotations
 
+import io
 import logging
 import os
+import tempfile
 import time
 import uuid
 import wave
@@ -157,15 +159,19 @@ class AudioRecorder(AudioRecorderBase):
             if self._dropped_chunks:
                 logger.debug("Recording: no data to write (all chunks dropped: %d)", self._dropped_chunks)
             return None
-        settings = get_settings()
-        os.makedirs(self._record_dir, exist_ok=True)
+
+        from app.config import transcript_storage_mongodb
+
         ts = int(time.time())
         base = f"session_{self._session_id}_{ts}"
+        pcm = bytes(self._buffer)
 
-        # Always write WAV first: single open, single write, single close
+        if transcript_storage_mongodb():
+            return self._finalize_to_mongodb(pcm, base)
+
+        os.makedirs(self._record_dir, exist_ok=True)
         wav_path = os.path.join(self._record_dir, f"{base}.wav")
-        _write_wav_sync(bytes(self._buffer), wav_path, self._sample_rate)
-
+        _write_wav_sync(pcm, wav_path, self._sample_rate)
         if self._format == "mp3":
             mp3_path = os.path.join(self._record_dir, f"{base}.mp3")
             _wav_to_mp3_sync(wav_path, mp3_path, self._bitrate)
@@ -176,10 +182,48 @@ class AudioRecorder(AudioRecorderBase):
             return mp3_path
         return wav_path
 
+    def _finalize_to_mongodb(self, pcm: bytes, base: str) -> Optional[str]:
+        """Write WAV/MP3 bytes to GridFS; link on transcript document."""
+        from app.db.recordings_storage import save_session_recording_sync
 
-def create_audio_recorder() -> AudioRecorderBase:
-    """Create recorder when ENABLE_AUDIO_RECORDING or ENABLE_BACKEND_RECORDING is true. Disabled by default."""
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_wav:
+            wav_tmp = tmp_wav.name
+        try:
+            _write_wav_sync(pcm, wav_tmp, self._sample_rate)
+            if self._format == "mp3":
+                from pydub import AudioSegment
+
+                segment = AudioSegment.from_wav(wav_tmp)
+                buf = io.BytesIO()
+                segment.export(buf, format="mp3", bitrate=self._bitrate)
+                audio_bytes = buf.getvalue()
+                filename = f"{base}.mp3"
+                content_type = "audio/mpeg"
+            else:
+                with open(wav_tmp, "rb") as f:
+                    audio_bytes = f.read()
+                filename = f"{base}.wav"
+                content_type = "audio/wav"
+        finally:
+            try:
+                os.remove(wav_tmp)
+            except OSError:
+                pass
+
+        meta = save_session_recording_sync(
+            self._session_id,
+            audio_bytes,
+            filename=filename,
+            content_type=content_type,
+        )
+        if meta:
+            return f"gridfs://{meta.get('bucket', 'recordings')}/{meta.get('file_id')}"
+        return None
+
+
+def create_audio_recorder(session_id: str | None = None) -> AudioRecorderBase:
+    """Create recorder when ENABLE_BACKEND_RECORDING is true."""
     settings = get_settings()
     if getattr(settings, "ENABLE_BACKEND_RECORDING", False) or getattr(settings, "ENABLE_AUDIO_RECORDING", False):
-        return AudioRecorder()
+        return AudioRecorder(session_id=session_id)
     return NoOpAudioRecorder()

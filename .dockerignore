@@ -1,0 +1,10 @@
+.venv
+venv
+__pycache__
+*.pyc
+.git
+.env
+transcripts
+recordings
+web/node_modules
+*.log

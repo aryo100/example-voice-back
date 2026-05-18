@@ -1,7 +1,7 @@
 """Application configuration. Loads from env vars."""
 from pydantic_settings import BaseSettings
-from pydantic import field_validator
-from typing import Literal
+from pydantic import field_validator, model_validator
+from typing import Literal, Self
 
 
 class Settings(BaseSettings):
@@ -56,10 +56,17 @@ class Settings(BaseSettings):
     AUDIO_RECORD_DIR: str = "./recordings"
     AUDIO_RECORD_BITRATE: str = "128k"
 
-    # Session transcript storage: one .txt per WebSocket, append-only (final segments only).
+    # Session transcript storage: file (./transcripts) or mongodb (TRANSCRIPT_STORAGE / USE_DATABASE).
+    USE_DATABASE: bool = False
+    TRANSCRIPT_STORAGE: Literal["file", "mongodb"] = "file"
     TRANSCRIPT_SAVE_ENABLED: bool = True
     TRANSCRIPT_DIR: str = "./transcripts"
-    TRANSCRIPT_ADD_TIMESTAMPS: bool = False  # prefix each line with [MM:SS.ss]
+    TRANSCRIPT_ADD_TIMESTAMPS: bool = False
+    # MongoDB (when TRANSCRIPT_STORAGE=mongodb)
+    MONGODB_URI: str = "mongodb://localhost:27017"
+    MONGODB_DATABASE: str = "voice_back"
+    MONGODB_TRANSCRIPTS_COLLECTION: str = "transcripts"
+    MONGODB_RECORDINGS_BUCKET: str = "recordings"  # GridFS bucket for session audio
 
     # Speaker-aware transcription (diarization only; no audio separation, single channel).
     DIARIZATION_ENABLED: bool = True
@@ -141,6 +148,29 @@ class Settings(BaseSettings):
             return v.strip().lower() in ("true", "1", "yes")
         return bool(v) if v is not None else False
 
+    @field_validator("TRANSCRIPT_STORAGE", mode="before")
+    @classmethod
+    def _normalize_transcript_storage(cls, v):
+        if v is None:
+            return "file"
+        s = str(v).strip().lower()
+        if s in ("mongo", "mongodb", "db", "database"):
+            return "mongodb"
+        return "file"
+
+    @field_validator("USE_DATABASE", mode="before")
+    @classmethod
+    def _coerce_use_database(cls, v):
+        if isinstance(v, str):
+            return v.strip().lower() in ("true", "1", "yes")
+        return bool(v) if v is not None else False
+
+    @model_validator(mode="after")
+    def _apply_use_database(self) -> Self:
+        if self.USE_DATABASE:
+            self.TRANSCRIPT_STORAGE = "mongodb"
+        return self
+
     class Config:
         env_file = ".env"
         extra = "ignore"
@@ -194,6 +224,15 @@ def chat_knowledge_multi_system() -> bool:
         return v
     if isinstance(v, str):
         return v.strip().lower() in ("true", "1", "yes")
+    return False
+
+
+def transcript_storage_mongodb() -> bool:
+    """True when transcripts are stored in MongoDB."""
+    s = get_settings()
+    raw = getattr(s, "TRANSCRIPT_STORAGE", "file")
+    if isinstance(raw, str):
+        return raw.strip().lower() in ("mongodb", "mongo", "db", "database")
     return False
 
 

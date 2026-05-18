@@ -25,7 +25,9 @@ from app.config import (
     chat_llm_compact_context_parts,
     chat_llm_compact_knowledge,
     chat_use_only_relevant_snippet,
+    transcript_storage_mongodb,
 )
+from app.db.mongo import close_mongo, connect_mongo
 from app.asr.base import ASREngine
 from app.asr.local_whisper import LocalWhisperEngine
 from app.asr.cloudflare import CloudflareWhisperEngine
@@ -184,8 +186,10 @@ async def lifespan(app: FastAPI):
         app.state.whisper_model = _load_whisper_model()
     else:
         app.state.whisper_model = None
+    if transcript_storage_mongodb():
+        await connect_mongo()
     yield
-    # Shutdown: no explicit cleanup needed for faster-whisper
+    await close_mongo()
     app.state.whisper_model = None
     _current_app = None
 
@@ -245,22 +249,28 @@ async def websocket_transcribe_with_assistant(websocket: WebSocket) -> None:
 
 @app.get("/health")
 async def health() -> dict:
-    return {"status": "ok"}
+    out: dict = {"status": "ok", "transcript_storage": get_settings().TRANSCRIPT_STORAGE}
+    if transcript_storage_mongodb():
+        try:
+            from app.db.mongo import get_mongo_client
+
+            await get_mongo_client().admin.command("ping")
+            out["mongodb"] = "ok"
+        except Exception as e:
+            out["status"] = "degraded"
+            out["mongodb"] = str(e)
+    return out
 
 
-def _save_refinement_layer(session_id: str, response: RefineResponse) -> None:
-    """Save refinement as revision layer: transcripts/{session_id}_refinements.json (original unchanged)."""
-    settings = get_settings()
-    transcript_dir = getattr(settings, "TRANSCRIPT_DIR", "./transcripts")
-    path = os.path.join(transcript_dir, f"{session_id}_refinements.json")
+async def _save_refinement_layer(session_id: str, response: RefineResponse) -> None:
+    from app.transcript.storage import save_refinement_layer
+
+    payload = [s.model_dump() for s in response.segments]
     try:
-        os.makedirs(transcript_dir, exist_ok=True)
-        payload = [s.model_dump() for s in response.segments]
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-        logger.info("Refinement layer saved: %s", path)
-    except OSError as e:
-        logger.warning("Failed to save refinement layer %s: %s", path, e)
+        await save_refinement_layer(session_id, payload)
+        logger.info("Refinement layer saved for session %s", session_id)
+    except Exception as e:
+        logger.warning("Failed to save refinement layer for %s: %s", session_id, e)
 
 
 
@@ -278,19 +288,20 @@ async def activate_session(request: ActivateSessionRequest) -> ActivateSessionRe
         )
 
     if transcript_body:
-        # Teks kustom: pakai session_id yang diberikan atau generate baru
         sid = session_id or generate_session_id()
         create_or_update_session_transcript(sid, transcript_body)
+        from app.transcript.storage import set_transcript_content
+
+        await set_transcript_content(sid, transcript_body)
         transcript_text = transcript_body
     else:
-        # Load dari file
         if not session_id:
             raise HTTPException(status_code=400, detail="session_id diperlukan bila transcript tidak dikirim")
-        transcript_text = get_transcript_context_for_chat(session_id)
+        transcript_text = await get_transcript_context_for_chat(session_id)
         if not (transcript_text or "").strip():
             raise HTTPException(
                 status_code=404,
-                detail=f"Transcript tidak ditemukan untuk session_id={session_id}. Pastikan file transcripts/{session_id}.txt ada.",
+                detail=f"Transcript tidak ditemukan untuk session_id={session_id}.",
             )
         ensure_session_from_transcript_file(session_id, transcript_text)
         sid = session_id
@@ -359,7 +370,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
     session = get_session(session_id)
     if not session:
         # Hydrate session from transcript file if it exists (e.g. after server restart)
-        transcript_from_file = get_transcript_context_for_chat(session_id)
+        transcript_from_file = await get_transcript_context_for_chat(session_id)
         session = ensure_session_from_transcript_file(session_id, transcript_from_file or "")
     if not session:
         raise HTTPException(
@@ -495,7 +506,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
     trigger_from_message = _is_invoking_assistant(message, assistant_name, name_aliases)
     trigger_from_session = _transcript_invokes_assistant(transcript_text, name_aliases)
     # Fallback: cek juga isi file transcript (session in-memory bisa tertinggal satu baris)
-    transcript_from_file = get_transcript_context_for_chat(session_id) or ""
+    transcript_from_file = await get_transcript_context_for_chat(session_id) or ""
     trigger_from_file = _transcript_invokes_assistant(transcript_from_file, name_aliases)
     trigger_audio = trigger_from_message or trigger_from_session or trigger_from_file
     # TTS: lokal pakai Edge TTS; nanti Cloudflare pakai TTS dari sana
@@ -517,7 +528,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
 @app.post("/api/refine-transcript", response_model=RefineResponse)
 async def refine_transcript(request: RefineRequest) -> RefineResponse:
     """One-time transcript refinement."""
-    if request.session_id and session_already_refined(request.session_id):
+    if request.session_id and await session_already_refined(request.session_id):
         raise HTTPException(
             status_code=400,
             detail="Transcript for this session has already been refined; use /api/chat for conversation",
@@ -531,6 +542,6 @@ async def refine_transcript(request: RefineRequest) -> RefineResponse:
         raise HTTPException(status_code=502, detail="Refine chat failed")
 
     if request.session_id:
-        _save_refinement_layer(request.session_id, response)
+        await _save_refinement_layer(request.session_id, response)
 
     return response

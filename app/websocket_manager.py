@@ -191,10 +191,8 @@ class WebSocketManager:
         self._chunk_queue: asyncio.Queue[tuple[bytes, float]] = asyncio.Queue()
         self._consumer_task: asyncio.Task[Any] | None = None
         self._closed = False
-        self._recorder: AudioRecorderBase = create_audio_recorder()
-
-        # One session ID per WebSocket; used for transcript file and optional recording
         self._session_id = uuid.uuid4().hex[:12]
+        self._recorder: AudioRecorderBase = create_audio_recorder(self._session_id)
         self._transcript_writer: TranscriptWriterBase | None = None
 
         # Segment-aware commit: only timestamps determine uniqueness; append-only final text.

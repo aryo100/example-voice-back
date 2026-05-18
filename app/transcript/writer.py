@@ -204,11 +204,85 @@ class TranscriptWriter(TranscriptWriterBase):
         self._worker_task = None
 
 
+class MongoTranscriptWriter(TranscriptWriterBase):
+    """Append final segments to MongoDB (lines array per session_id)."""
+
+    def __init__(self, session_id: str, session_start_ms: int, add_timestamps: bool | None = None) -> None:
+        settings = get_settings()
+        self._session_id = session_id
+        self._session_start_ms = session_start_ms
+        self._add_timestamps = add_timestamps if add_timestamps is not None else settings.TRANSCRIPT_ADD_TIMESTAMPS
+        self._queue: asyncio.Queue[str | None] = asyncio.Queue()
+        self._worker_task: asyncio.Task | None = None
+        self._started = False
+
+    async def _worker(self) -> None:
+        from app.transcript.storage import append_transcript_line
+
+        while True:
+            line = await self._queue.get()
+            if line is None:
+                break
+            try:
+                await append_transcript_line(self._session_id, line)
+            except Exception as e:
+                logger.warning("Mongo transcript write failed for %s: %s", self._session_id, e)
+
+    async def start(self) -> None:
+        if self._started:
+            return
+        self._started = True
+        self._worker_task = asyncio.create_task(self._worker())
+
+    def append_final(
+        self,
+        text: str,
+        timestamp_ms: int | None = None,
+        speaker_id: str | None = None,
+        start_time: float | None = None,
+        end_time: float | None = None,
+        overlap: bool = False,
+    ) -> None:
+        text = (text or "").strip()
+        if not text:
+            return
+        if speaker_id is not None or overlap:
+            line = _format_speaker_line(
+                text, timestamp_ms, self._session_start_ms, self._add_timestamps, speaker_id, overlap
+            )
+        elif self._add_timestamps and timestamp_ms is not None:
+            line = _format_timestamp_line(timestamp_ms, self._session_start_ms, text)
+        else:
+            line = text
+        try:
+            self._queue.put_nowait(line)
+        except asyncio.QueueFull:
+            logger.warning("Mongo transcript queue full for session %s", self._session_id)
+
+    async def close(self) -> None:
+        if not self._started or self._worker_task is None:
+            return
+        try:
+            self._queue.put_nowait(None)
+            await asyncio.wait_for(self._worker_task, timeout=5.0)
+        except asyncio.TimeoutError:
+            self._worker_task.cancel()
+            try:
+                await self._worker_task
+            except asyncio.CancelledError:
+                pass
+        self._worker_task = None
+
+
 def create_transcript_writer(session_id: str, session_start_ms: int) -> TranscriptWriterBase:
-    """Create writer when TRANSCRIPT_SAVE_ENABLED is true; else no-op."""
+    """Create writer when TRANSCRIPT_SAVE_ENABLED is true; file or MongoDB per TRANSCRIPT_STORAGE."""
     settings = get_settings()
     if not getattr(settings, "TRANSCRIPT_SAVE_ENABLED", True):
         return NoOpTranscriptWriter()
+    from app.config import transcript_storage_mongodb
+
+    if transcript_storage_mongodb():
+        return MongoTranscriptWriter(session_id=session_id, session_start_ms=session_start_ms)
     return TranscriptWriter(
         session_id=session_id,
         session_start_ms=session_start_ms,

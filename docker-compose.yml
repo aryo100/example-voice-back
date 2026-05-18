@@ -1,0 +1,55 @@
+services:
+  mongodb:
+    image: mongo:7
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  mongo-express:
+    image: mongo-express:1.0.2-20
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8081:8081"
+    environment:
+      # Override image default (mongodb://mongo:27017) — service name is "mongodb"
+      ME_CONFIG_MONGODB_URL: mongodb://mongodb:27017/
+      ME_CONFIG_MONGODB_ENABLE_ADMIN: "true"
+      # Port is 127.0.0.1-only; disable Basic Auth so browsers work without a login dialog
+      # (curl -u worked; plain browser showed blank "Unauthorized").
+      ME_CONFIG_BASICAUTH: "false"
+      ME_CONFIG_SITE_BASEURL: /
+    depends_on:
+      mongodb:
+        condition: service_healthy
+
+  api:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      USE_DATABASE: "true"
+      TRANSCRIPT_STORAGE: mongodb
+      MONGODB_URI: mongodb://mongodb:27017
+      MONGODB_DATABASE: voice_back
+      MONGODB_TRANSCRIPTS_COLLECTION: transcripts
+      MONGODB_RECORDINGS_BUCKET: recordings
+      ASR_BACKEND: cloudflare
+    volumes:
+      - ./transcripts:/app/transcripts
+      - ./recordings:/app/recordings
+    depends_on:
+      mongodb:
+        condition: service_healthy
+
+volumes:
+  mongo_data:

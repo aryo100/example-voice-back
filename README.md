@@ -25,6 +25,26 @@ pip install faster-whisper
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
+### Docker (API + MongoDB)
+
+```bash
+# Salin .env dan isi API keys (Cloudflare, OpenRouter, dll.)
+cp .env.example .env
+
+docker compose up --build
+```
+
+- API: http://localhost:8000
+- **Mongo Express (DB UI):** http://127.0.0.1:8081 — pilih database `voice_back` (Basic Auth off; port hanya `127.0.0.1` di Docker)
+  - Collection `transcripts` — teks dialog + field `recording` (metadata audio)
+  - Collections `recordings.files` / `recordings.chunks` — audio GridFS (saat `ENABLE_BACKEND_RECORDING=true`)
+- MongoDB: `mongodb://localhost:27017`
+- Compose sets `USE_DATABASE=true`, `MONGODB_URI=mongodb://mongodb:27017`
+
+**Rekaman audio ke MongoDB:** set di `.env` `ENABLE_BACKEND_RECORDING=true` (dan `USE_DATABASE=true`). File disimpan di GridFS bucket `recordings`, metadata di dokumen `transcripts`.
+
+Tanpa Docker: set `USE_DATABASE=true` (atau `TRANSCRIPT_STORAGE=mongodb`) dan jalankan MongoDB lokal, lalu `MONGODB_URI=mongodb://localhost:27017`.
+
 - **WebSocket**: `ws://localhost:8000/ws/transcribe`
 - **Health**: `GET http://localhost:8000/health`
 - **API docs (Swagger, TypeScript)**: run the `web/` dev server — `cd web && npm install && npm run dev` → [http://localhost:8080/docs](http://localhost:8080/docs)
