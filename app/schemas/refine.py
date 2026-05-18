@@ -1,10 +1,5 @@
 """
 Schemas for context-aware re-transcription (refine-transcript) API.
-
-Inputs: user question, raw transcript segments (timestamps + confidence),
-optional audio reference (last N seconds or description), domain hint.
-Output: structured JSON per segment (original, refined, confidence, justification).
-Original transcript is never overwritten; refined is a revision layer.
 """
 from __future__ import annotations
 
@@ -12,8 +7,6 @@ from pydantic import BaseModel, Field
 
 
 class RefineSegmentInput(BaseModel):
-    """One raw transcript segment as input to the refine API."""
-
     segment_id: str = Field(..., description="Unique id for this segment (e.g. index or uuid)")
     text: str = Field(..., description="Original STT text")
     start_sec: float = Field(0.0, description="Start time in seconds")
@@ -32,7 +25,7 @@ class RefineRequest(BaseModel):
     )
     audio_description: str | None = Field(
         None,
-        description="Optional short description of audio (e.g. 'gadget unboxing') when no file",
+        description="Optional short description of audio when no file",
     )
     domain_hint: str | None = Field(
         None,
@@ -45,8 +38,6 @@ class RefineRequest(BaseModel):
 
 
 class RefineSegmentOutput(BaseModel):
-    """One segment in the refine API response (structured JSON as specified)."""
-
     segment_id: str
     original_text: str
     refined_text: str
@@ -56,7 +47,5 @@ class RefineSegmentOutput(BaseModel):
 
 
 class RefineResponse(BaseModel):
-    """Response body for POST /api/refine-transcript."""
-
     segments: list[RefineSegmentOutput] = Field(..., description="Per-segment refinement result")
     session_id: str | None = Field(None, description="Set when revision layer was stored")

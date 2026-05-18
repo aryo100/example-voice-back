@@ -35,7 +35,7 @@ class ChatRequest(BaseModel):
 
 
 class ActivateSessionRequest(BaseModel):
-    """Request untuk mengaktifkan session dengan transcript (dari file atau teks kustom). Setelah aktif, POST /api/chat dengan session_id ini siap dipanggil."""
+    """Request untuk mengaktifkan session dengan transcript (dari file atau teks kustom)."""
 
     session_id: str | None = Field(
         None,
@@ -43,7 +43,7 @@ class ActivateSessionRequest(BaseModel):
     )
     transcript: str | None = Field(
         None,
-        description="Teks transcript kustom. Bila dikirim bersama session_id, session tersebut diisi transcript ini; bila hanya transcript, session_id baru digenerate.",
+        description="Teks transcript kustom.",
     )
 
 
@@ -54,17 +54,16 @@ class ActivateSessionResponse(BaseModel):
 
 
 class ChatResponse(BaseModel):
-    """Response body for POST /api/chat. session_id + text (assistant reply); audio for TTS when available."""
+    """Response body for POST /api/chat."""
 
     session_id: str | None = Field(None, description="Same for entire session; never regenerated during chat")
     text: str = Field("", description="Assistant reply (for display and TTS; never transcript content)")
-    audio: str | None = Field(None, description="TTS audio (e.g. base64) or null; only for assistant reply, never transcript")
-    trigger_audio: bool = Field(False, description="True when user invoked assistant by name (e.g. Salam); client should play TTS for this reply")
+    audio: str | None = Field(None, description="TTS audio (e.g. base64) or null")
+    trigger_audio: bool = Field(False, description="True when user invoked assistant by name")
     reply: str | None = Field(None, description="Legacy alias for text")
     mode: str | None = Field(None, description="Legacy: chat | refine")
     message: str | None = Field(None, description="Legacy alias for text")
     refinement: RefineResponse | None = Field(None, description="Legacy: present only when mode=refine")
 
     class Config:
-        # Populate text/reply/message for backward compatibility
         populate_by_name = True

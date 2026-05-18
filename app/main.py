@@ -194,6 +194,9 @@ app = FastAPI(
     title="Real-time Speech-to-Text",
     description="WebSocket streaming ASR with VAD and chunking",
     lifespan=lifespan,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
 )
 
 # CORS: agar frontend di port lain (e.g. localhost:8080) bisa POST /api/chat, /api/session/activate (OPTIONS preflight → 200)
@@ -208,11 +211,7 @@ app.add_middleware(
 
 @app.websocket("/ws/transcribe")
 async def websocket_transcribe(websocket: WebSocket) -> None:
-    """
-    WebSocket: client sends raw PCM 16-bit mono 16kHz (binary).
-    Server sends JSON: { type, text, confidence, timestamp [, word_timestamps] }.
-    Hanya transcript; tidak ada assistant_reply.
-    """
+    """WebSocket: PCM 16-bit mono 16kHz in; JSON partial/final out."""
     await websocket.accept()
     engine = get_asr_engine()
     manager = WebSocketManager(websocket, engine)
@@ -229,11 +228,7 @@ async def websocket_transcribe(websocket: WebSocket) -> None:
 
 @app.websocket("/ws/transcribe-with-assistant")
 async def websocket_transcribe_with_assistant(websocket: WebSocket) -> None:
-    """
-    WebSocket sama seperti /ws/transcribe, plus: bila transcript memanggil asisten (e.g. Salam),
-    server kirim dulu { type: "assistant_processing", message: "Menunggu respons..." }, lalu setelah LLM + TTS selesai
-    kirim { type: "assistant_reply", text, trigger_audio, audio?, audio_mime }. Client tampilkan waiting sampai assistant_reply.
-    """
+    """Like /ws/transcribe; may emit assistant_processing and assistant_reply."""
     await websocket.accept()
     engine = get_asr_engine()
     manager = WebSocketManagerWithAssistant(websocket, engine)
@@ -272,13 +267,7 @@ def _save_refinement_layer(session_id: str, response: RefineResponse) -> None:
 
 @app.post("/api/session/activate", response_model=ActivateSessionResponse)
 async def activate_session(request: ActivateSessionRequest) -> ActivateSessionResponse:
-    """
-    Aktifkan session dengan transcript dari file atau teks kustom. Setelah ini, POST /api/chat dengan
-    session_id yang dikembalikan siap dipanggil (transcript jadi knowledge untuk asisten).
-    - Hanya session_id: load transcript dari transcripts/{session_id}.txt
-    - Hanya transcript: buat session_id baru, isi transcript tersebut
-    - session_id + transcript: pakai session_id itu, isi dengan transcript (override file)
-    """
+    """Aktifkan session dari file atau teks kustom."""
     session_id = (request.session_id or "").strip() or None
     transcript_body = (request.transcript or "").strip() or None
 
@@ -349,13 +338,7 @@ async def activate_session(request: ActivateSessionRequest) -> ActivateSessionRe
 
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest) -> ChatResponse:
-    """
-    Chat with session. Transcript is knowledge only (transcript_summary); never spoken, never sent to TTS.
-    On first chat: build transcript summary if missing. On subsequent: reuse summary + chat history.
-    Chat works even when transcript WebSocket is closed (session hydrated from file if needed).
-    Transcript is NEVER rewritten unless explicitly requested (e.g. /api/refine-transcript).
-    Returns: session_id, text (assistant reply for TTS), audio (null unless TTS implemented).
-    """
+    """Chat dengan session; transcript sebagai knowledge."""
     action = (request.action or "").strip() or None
     session_id = (request.session_id or "").strip() or None
     message = (request.message or "").strip() if request.message else ""
@@ -533,13 +516,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
 
 @app.post("/api/refine-transcript", response_model=RefineResponse)
 async def refine_transcript(request: RefineRequest) -> RefineResponse:
-    """
-    One-time transcript refinement (explicit). Refuses if session already refined.
-
-    Inputs: user question, raw transcript segments (timestamps + confidence),
-    optional audio reference, domain hint, session_id.
-    Output: per-segment refined text, confidence, justification. Stored as revision layer.
-    """
+    """One-time transcript refinement."""
     if request.session_id and session_already_refined(request.session_id):
         raise HTTPException(
             status_code=400,

@@ -26,7 +26,9 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
 - **WebSocket**: `ws://localhost:8000/ws/transcribe`
-- **Health**: `GET /health`
+- **Health**: `GET http://localhost:8000/health`
+- **API docs (Swagger, TypeScript)**: run the `web/` dev server — `cd web && npm install && npm run dev` → [http://localhost:8080/docs](http://localhost:8080/docs)
+- **Stream test UI**: [http://localhost:8080/stream_test.html](http://localhost:8080/stream_test.html) (same dev server; proxies `/api/*` to port 8000)
 - **Refine transcript**: `POST /api/refine-transcript` — context-aware re-transcription using chat AI (see [docs/REFINE_TRANSCRIPT.md](docs/REFINE_TRANSCRIPT.md))
 
 ## Streaming Logic: Chunking + VAD
