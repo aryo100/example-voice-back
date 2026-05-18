@@ -33,6 +33,7 @@ from app.audio import (
 from app.asr.base import ASREngine
 from app.config import (
     get_settings,
+    assistant_name_and_aliases,
     chat_knowledge_multi_system,
     chat_llm_compact_context_parts,
     chat_llm_compact_knowledge,
@@ -482,15 +483,10 @@ class WebSocketManager:
 
 # --- Subclass untuk route dengan assistant reply via WS ---
 def _transcript_contains_assistant(transcript_text: str) -> bool:
-    """True bila transcript berisi nama asisten atau alias (e.g. Salam). Dipakai di WS dengan assistant."""
+    """True bila transcript berisi nama asisten atau alias (dari assistant/identity.md)."""
     if not (transcript_text or "").strip():
         return False
-    settings = get_settings()
-    name = (getattr(settings, "ASSISTANT_NAME", "") or "Salam").strip().lower()
-    aliases_str = (getattr(settings, "ASSISTANT_NAME_ALIASES", "") or "").strip()
-    aliases = [a.strip().lower() for a in aliases_str.split(",") if a.strip()]
-    if name and name not in aliases:
-        aliases.insert(0, name)
+    _, aliases = assistant_name_and_aliases()
     transcript_lower = transcript_text.strip().lower()
     return any(n and n in transcript_lower for n in aliases)
 

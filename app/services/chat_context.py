@@ -14,6 +14,7 @@ import re
 from typing import Any
 
 from app.config import get_settings
+from app.services.assistant_persona import format_persona_for_system_prompt
 from app.services.llm_provider import completion as llm_completion
 
 logger = logging.getLogger(__name__)
@@ -386,6 +387,10 @@ def select_relevant_snippets(transcript_text: str, user_question: str, max_chars
     return text
 
 
+def _assistant_persona_section() -> str:
+    return format_persona_for_system_prompt()
+
+
 def build_chat_system_prompt(
     session_id: str,
     global_summary: str,
@@ -399,6 +404,7 @@ def build_chat_system_prompt(
     """
     parts = [
         "You are a conversational assistant for a voice streaming app. You have access to a SUMMARY of what the user has said (from speech-to-text), not the full transcript.",
+        _assistant_persona_section(),
         "- If the transcript includes speaker labels (e.g. Speaker A, Speaker B), you may reference them: 'Speaker A said...', 'When Speaker B interrupted...'. Labels are session-local and do not imply real identities.",
         "",
         "RULES:",
@@ -437,8 +443,10 @@ def build_chat_system_prompt_for_tts(transcript_summary: str) -> str:
     Transcript summary is used as context only; never spoken. Replies are suitable for TTS.
     Do NOT include timestamps or speaker labels in the model output.
     """
+    persona = _assistant_persona_section()
     return (
-        "You are a conversational AI assistant.\n"
+        "You are a conversational AI assistant for a voice session.\n"
+        f"{persona}\n"
         "You have access to transcript context as background knowledge.\n"
         "Do NOT repeat transcript unless asked.\n"
         "Respond naturally for spoken output.\n"
@@ -456,8 +464,10 @@ def build_llm_compact_knowledge_system_prompt(knowledge_text: str) -> str:
     System prompt untuk CHAT_LLM_COMPACT_KNOWLEDGE: isi knowledge tanpa label CONTEXT / Transcript summary.
     """
     body = (knowledge_text or "").strip() or "(No knowledge yet.)"
+    persona = _assistant_persona_section()
     return (
-        "You are a conversational AI assistant.\n"
+        "You are a conversational AI assistant for a voice session.\n"
+        f"{persona}\n"
         "You have access to session knowledge derived from voice transcripts (may be partial or summarized).\n"
         "Do NOT repeat content verbatim unless asked.\n"
         "Respond naturally for spoken output.\n"
@@ -476,6 +486,7 @@ def build_chat_knowledge_base_system_prompt(extra_instructions: str = "") -> str
     extra = (extra_instructions or "").strip()
     parts = [
         "You are a conversational AI assistant for a voice session.",
+        _assistant_persona_section(),
         "The following additional system messages are consecutive transcript segments (read-only knowledge).",
         "Each segment header states the inclusive line range (1-based, file order).",
         "Answer the user using this knowledge; do not invent facts not supported by the transcript.",
@@ -584,6 +595,7 @@ def build_chat_system_prompt_llm_compact(
     if knowledge_omit_summary:
         lines = [
             "You are a conversational AI assistant for a voice session.",
+            _assistant_persona_section(),
             "A transcript exists for this session but is not included in this request: no excerpts, no truncated transcript lines, and no summary text from the transcript.",
             "Answer from the user's message and general reasoning; if the answer depends on transcript content you were not given, say so briefly.",
             "Respond naturally for spoken output.",
@@ -596,7 +608,8 @@ def build_chat_system_prompt_llm_compact(
     if parts == "excerpt_only":
         body = (relevant_snippets or "").strip() or "(Tidak ada cuplikan relevan untuk pertanyaan ini.)"
         lines = [
-            "You are a conversational AI assistant.",
+            "You are a conversational AI assistant for a voice session.",
+            _assistant_persona_section(),
             "You only have a short relevant excerpt from a longer voice transcript (not the full transcript).",
             "Answer the user's question using the excerpt; if it is not enough to answer, say so briefly.",
             "Respond naturally for spoken output.",
@@ -620,7 +633,6 @@ def build_chat_system_prompt_llm_compact(
             used_wide_fallback = True
 
     system_prompt = build_llm_compact_knowledge_system_prompt(transcript_text or "(No knowledge yet.)")
-    logger.info("system_prompt: %s", system_prompt)
     if parts != "summary_only" and (relevant_snippets or "").strip() and not used_wide_fallback:
         system_prompt = system_prompt + "\n\nRelevant excerpt (for this question only):\n" + relevant_snippets.strip()
     if extra:

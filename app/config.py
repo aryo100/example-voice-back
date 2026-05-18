@@ -107,10 +107,8 @@ class Settings(BaseSettings):
     CHAT_KNOWLEDGE_MAX_CHUNKS: int = 40
     CHAT_KNOWLEDGE_MAX_CHARS_PER_CHUNK: int = 12000
 
-    # Asisten (nama untuk trigger audio/TTS): bila user memanggil nama ini atau nama ada di transcript, respons bisa diputar sebagai audio.
-    ASSISTANT_NAME: str = "Salam"
-    # Alias nama (ASR kadang menulis variasi); dipakai untuk deteksi di pesan dan transcript. Comma-separated.
-    ASSISTANT_NAME_ALIASES: str = ""
+    # Folder persona asisten (identity.md + soul.md). Relatif ke root proyek atau path absolut.
+    ASSISTANT_PERSONA_DIR: str = "assistant"
     # Debounce (detik): jangan kirim assistant_reply via WS lebih sering dari ini setelah pemanggilan nama.
     ASSISTANT_WS_DEBOUNCE_SEC: float = 15.0
 
@@ -197,3 +195,10 @@ def chat_knowledge_multi_system() -> bool:
     if isinstance(v, str):
         return v.strip().lower() in ("true", "1", "yes")
     return False
+
+
+def assistant_name_and_aliases() -> tuple[str, list[str]]:
+    """Nama & alias dari assistant/identity.md (frontmatter) — untuk deteksi TTS."""
+    from app.services.assistant_persona import assistant_name_and_aliases as _from_persona
+
+    return _from_persona()

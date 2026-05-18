@@ -1,0 +1,4 @@
+---
+name: Salam
+aliases: sal
+---

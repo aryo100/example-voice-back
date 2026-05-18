@@ -20,6 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import (
     get_settings,
+    assistant_name_and_aliases,
     chat_knowledge_multi_system,
     chat_llm_compact_context_parts,
     chat_llm_compact_knowledge,
@@ -63,12 +64,7 @@ logger = logging.getLogger(__name__)
 
 def _assistant_name_and_aliases(settings: Any) -> tuple[str, list[str]]:
     """Return (assistant_name, list of aliases including name). Used for message and transcript checks."""
-    name = (getattr(settings, "ASSISTANT_NAME", "") or "Salam").strip()
-    aliases_str = (getattr(settings, "ASSISTANT_NAME_ALIASES", "") or "").strip()
-    aliases = [a.strip().lower() for a in aliases_str.split(",") if a.strip()]
-    if name.lower() not in aliases:
-        aliases.insert(0, name.lower())
-    return name, aliases
+    return assistant_name_and_aliases()
 
 
 def _is_invoking_assistant(user_message: str, assistant_name: str, name_aliases: list[str] | None = None) -> bool:
