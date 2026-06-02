@@ -1,5 +1,5 @@
 """
-Transcript persistence: file (default) or MongoDB (TRANSCRIPT_STORAGE=mongodb).
+Transcript persistence: file (default) or PostgreSQL (TRANSCRIPT_STORAGE=postgresql).
 """
 from __future__ import annotations
 
@@ -8,17 +8,13 @@ import logging
 import os
 from typing import Any
 
-from app.config import get_settings, transcript_storage_mongodb
+from app.config import get_settings, transcript_storage_postgresql
 
 logger = logging.getLogger(__name__)
 
 
 def _transcript_dir() -> str:
     return getattr(get_settings(), "TRANSCRIPT_DIR", "./transcripts")
-
-
-def _mongo_collection_name() -> str:
-    return getattr(get_settings(), "MONGODB_TRANSCRIPTS_COLLECTION", "transcripts")
 
 
 def _file_path(session_id: str) -> str:
@@ -86,119 +82,57 @@ def _file_has_refinements(session_id: str) -> bool:
     return os.path.isfile(_refinements_file_path(session_id))
 
 
-# --- MongoDB ---
-
-
-async def _mongo_append_line(session_id: str, line: str) -> None:
-    from app.db.mongo import get_mongo_db
-
-    await get_mongo_db()[_mongo_collection_name()].update_one(
-        {"session_id": session_id},
-        {"$push": {"lines": line}, "$set": {"session_id": session_id}},
-        upsert=True,
-    )
-
-
-async def _mongo_get_content(session_id: str) -> str | None:
-    from app.db.mongo import get_mongo_db
-
-    doc = await get_mongo_db()[_mongo_collection_name()].find_one(
-        {"session_id": session_id},
-        projection={"lines": 1, "content": 1},
-    )
-    if not doc:
-        return None
-    if doc.get("lines"):
-        text = "\n".join(str(x) for x in doc["lines"]).strip()
-        return text or None
-    raw = (doc.get("content") or "").strip()
-    return raw or None
-
-
-async def _mongo_set_content(session_id: str, content: str) -> None:
-    from app.db.mongo import get_mongo_db
-
-    text = (content or "").strip()
-    lines = [ln for ln in text.splitlines() if ln.strip()] if text else []
-    await get_mongo_db()[_mongo_collection_name()].update_one(
-        {"session_id": session_id},
-        {"$set": {"session_id": session_id, "content": text, "lines": lines}},
-        upsert=True,
-    )
-
-
-async def _mongo_save_refinements(session_id: str, payload: list[dict[str, Any]]) -> None:
-    from app.db.mongo import get_mongo_db
-
-    await get_mongo_db()[_mongo_collection_name()].update_one(
-        {"session_id": session_id},
-        {"$set": {"session_id": session_id, "refinements": payload}},
-        upsert=True,
-    )
-
-
-async def _mongo_get_refinements(session_id: str) -> list[dict[str, Any]] | None:
-    from app.db.mongo import get_mongo_db
-
-    doc = await get_mongo_db()[_mongo_collection_name()].find_one(
-        {"session_id": session_id},
-        projection={"refinements": 1},
-    )
-    if not doc:
-        return None
-    ref = doc.get("refinements")
-    return ref if isinstance(ref, list) else None
-
-
-async def _mongo_has_refinements(session_id: str) -> bool:
-    from app.db.mongo import get_mongo_db
-
-    doc = await get_mongo_db()[_mongo_collection_name()].find_one(
-        {"session_id": session_id},
-        projection={"refinements": 1},
-    )
-    return bool(doc and doc.get("refinements"))
-
-
 # --- Public ---
 
 
 async def append_transcript_line(session_id: str, line: str) -> None:
-    if transcript_storage_mongodb():
-        await _mongo_append_line(session_id, line)
+    if transcript_storage_postgresql():
+        from app.db import transcript_repo
+
+        await transcript_repo.append_line(session_id, line)
     else:
         _file_append_line(session_id, line)
 
 
 async def get_transcript_content(session_id: str) -> str | None:
-    if transcript_storage_mongodb():
-        return await _mongo_get_content(session_id)
+    if transcript_storage_postgresql():
+        from app.db import transcript_repo
+
+        return await transcript_repo.get_content(session_id)
     return _file_get_content(session_id)
 
 
 async def set_transcript_content(session_id: str, content: str) -> None:
-    if transcript_storage_mongodb():
-        await _mongo_set_content(session_id, content)
+    if transcript_storage_postgresql():
+        from app.db import transcript_repo
+
+        await transcript_repo.set_content(session_id, content)
     else:
         _file_set_content(session_id, content)
 
 
 async def save_refinement_layer(session_id: str, payload: list[dict[str, Any]]) -> None:
-    if transcript_storage_mongodb():
-        await _mongo_save_refinements(session_id, payload)
+    if transcript_storage_postgresql():
+        from app.db import transcript_repo
+
+        await transcript_repo.save_refinements(session_id, payload)
     else:
         _file_save_refinements(session_id, payload)
 
 
 async def get_refinement_layer(session_id: str) -> list[dict[str, Any]] | None:
-    if transcript_storage_mongodb():
-        return await _mongo_get_refinements(session_id)
+    if transcript_storage_postgresql():
+        from app.db import transcript_repo
+
+        return await transcript_repo.get_refinements(session_id)
     return _file_get_refinements(session_id)
 
 
 async def session_has_refinements(session_id: str) -> bool:
-    if transcript_storage_mongodb():
-        return await _mongo_has_refinements(session_id)
+    if transcript_storage_postgresql():
+        from app.db import transcript_repo
+
+        return await transcript_repo.has_refinements(session_id)
     return _file_has_refinements(session_id)
 
 

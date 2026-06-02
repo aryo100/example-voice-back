@@ -204,8 +204,8 @@ class TranscriptWriter(TranscriptWriterBase):
         self._worker_task = None
 
 
-class MongoTranscriptWriter(TranscriptWriterBase):
-    """Append final segments to MongoDB (lines array per session_id)."""
+class PostgresTranscriptWriter(TranscriptWriterBase):
+    """Append final segments to PostgreSQL (lines JSON array per session_id)."""
 
     def __init__(self, session_id: str, session_start_ms: int, add_timestamps: bool | None = None) -> None:
         settings = get_settings()
@@ -226,7 +226,7 @@ class MongoTranscriptWriter(TranscriptWriterBase):
             try:
                 await append_transcript_line(self._session_id, line)
             except Exception as e:
-                logger.warning("Mongo transcript write failed for %s: %s", self._session_id, e)
+                logger.warning("PostgreSQL transcript write failed for %s: %s", self._session_id, e)
 
     async def start(self) -> None:
         if self._started:
@@ -257,7 +257,7 @@ class MongoTranscriptWriter(TranscriptWriterBase):
         try:
             self._queue.put_nowait(line)
         except asyncio.QueueFull:
-            logger.warning("Mongo transcript queue full for session %s", self._session_id)
+            logger.warning("PostgreSQL transcript queue full for session %s", self._session_id)
 
     async def close(self) -> None:
         if not self._started or self._worker_task is None:
@@ -275,14 +275,14 @@ class MongoTranscriptWriter(TranscriptWriterBase):
 
 
 def create_transcript_writer(session_id: str, session_start_ms: int) -> TranscriptWriterBase:
-    """Create writer when TRANSCRIPT_SAVE_ENABLED is true; file or MongoDB per TRANSCRIPT_STORAGE."""
+    """Create writer when TRANSCRIPT_SAVE_ENABLED is true; file or PostgreSQL per TRANSCRIPT_STORAGE."""
     settings = get_settings()
     if not getattr(settings, "TRANSCRIPT_SAVE_ENABLED", True):
         return NoOpTranscriptWriter()
-    from app.config import transcript_storage_mongodb
+    from app.config import transcript_storage_postgresql
 
-    if transcript_storage_mongodb():
-        return MongoTranscriptWriter(session_id=session_id, session_start_ms=session_start_ms)
+    if transcript_storage_postgresql():
+        return PostgresTranscriptWriter(session_id=session_id, session_start_ms=session_start_ms)
     return TranscriptWriter(
         session_id=session_id,
         session_start_ms=session_start_ms,

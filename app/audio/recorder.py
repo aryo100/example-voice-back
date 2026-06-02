@@ -160,14 +160,20 @@ class AudioRecorder(AudioRecorderBase):
                 logger.debug("Recording: no data to write (all chunks dropped: %d)", self._dropped_chunks)
             return None
 
-        from app.config import transcript_storage_mongodb
+        from app.config import object_storage_enabled, transcript_storage_postgresql
 
         ts = int(time.time())
         base = f"session_{self._session_id}_{ts}"
         pcm = bytes(self._buffer)
 
-        if transcript_storage_mongodb():
-            return self._finalize_to_mongodb(pcm, base)
+        if transcript_storage_postgresql():
+            if object_storage_enabled():
+                return self._finalize_to_cloud_storage(pcm, base)
+            logger.warning(
+                "Recording skipped: USE_DATABASE=true but OBJECT_STORAGE_BACKEND is not configured "
+                "(set supabase or firebase). Audio is not stored in PostgreSQL or the container."
+            )
+            return None
 
         os.makedirs(self._record_dir, exist_ok=True)
         wav_path = os.path.join(self._record_dir, f"{base}.wav")
@@ -182,8 +188,8 @@ class AudioRecorder(AudioRecorderBase):
             return mp3_path
         return wav_path
 
-    def _finalize_to_mongodb(self, pcm: bytes, base: str) -> Optional[str]:
-        """Write WAV/MP3 bytes to GridFS; link on transcript document."""
+    def _finalize_to_cloud_storage(self, pcm: bytes, base: str) -> Optional[str]:
+        """Encode WAV/MP3, upload to Supabase/Firebase; URL saved in PostgreSQL."""
         from app.db.recordings_storage import save_session_recording_sync
 
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_wav:
@@ -217,7 +223,7 @@ class AudioRecorder(AudioRecorderBase):
             content_type=content_type,
         )
         if meta:
-            return f"gridfs://{meta.get('bucket', 'recordings')}/{meta.get('file_id')}"
+            return meta.get("url")
         return None
 
 

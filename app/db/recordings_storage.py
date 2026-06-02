@@ -1,21 +1,16 @@
-"""Session audio recordings in MongoDB GridFS (when USE_DATABASE / TRANSCRIPT_STORAGE=mongodb)."""
+"""Upload session recordings to cloud object storage; persist URL in PostgreSQL."""
 from __future__ import annotations
 
-import io
+import asyncio
+import concurrent.futures
 import logging
 from typing import Any
 
-from app.config import get_settings, transcript_storage_mongodb
+from app.config import transcript_storage_postgresql
+from app.db import transcript_repo
+from app.storage.object_storage import object_storage_enabled, upload_recording_sync
 
 logger = logging.getLogger(__name__)
-
-
-def _recordings_bucket_name() -> str:
-    return getattr(get_settings(), "MONGODB_RECORDINGS_BUCKET", "recordings")
-
-
-def _transcripts_collection_name() -> str:
-    return getattr(get_settings(), "MONGODB_TRANSCRIPTS_COLLECTION", "transcripts")
 
 
 async def save_session_recording(
@@ -26,42 +21,41 @@ async def save_session_recording(
     content_type: str,
 ) -> dict[str, Any]:
     """
-    Upload audio to GridFS and link metadata on the transcript document.
-    Returns {file_id, filename, content_type, size, bucket}.
+    Upload audio to Supabase/Firebase Storage and save the URL in PostgreSQL.
+    Returns {url, filename, content_type, size}.
     """
-    from motor.motor_asyncio import AsyncIOMotorGridFSBucket
+    if not transcript_storage_postgresql():
+        raise RuntimeError("PostgreSQL transcript storage is not enabled")
+    if not object_storage_enabled():
+        raise RuntimeError("OBJECT_STORAGE_BACKEND must be supabase or firebase for cloud recordings")
 
-    from app.db.mongo import get_mongo_db
-
-    db = get_mongo_db()
-    bucket_name = _recordings_bucket_name()
-    bucket = AsyncIOMotorGridFSBucket(db, bucket_name=bucket_name)
-
-    file_id = await bucket.upload_from_stream(
-        filename,
-        io.BytesIO(audio_bytes),
-        metadata={
-            "session_id": session_id,
-            "content_type": content_type,
-        },
+    object_path = f"{session_id}/{filename}"
+    loop = asyncio.get_running_loop()
+    url = await loop.run_in_executor(
+        None,
+        upload_recording_sync,
+        object_path,
+        audio_bytes,
+        content_type,
     )
     meta = {
-        "file_id": str(file_id),
+        "url": url,
         "filename": filename,
         "content_type": content_type,
         "size": len(audio_bytes),
-        "bucket": bucket_name,
+        "object_path": object_path,
     }
-    await db[_transcripts_collection_name()].update_one(
-        {"session_id": session_id},
-        {"$set": {"session_id": session_id, "recording": meta}},
-        upsert=True,
+    await transcript_repo.set_recording_metadata(
+        session_id,
+        url=url,
+        filename=filename,
+        content_type=content_type,
+        size=len(audio_bytes),
     )
     logger.info(
-        "Recording saved to GridFS bucket=%s session_id=%s file_id=%s size=%d",
-        bucket_name,
+        "Recording uploaded session_id=%s url=%s size=%d",
         session_id,
-        file_id,
+        url,
         len(audio_bytes),
     )
     return meta
@@ -75,9 +69,8 @@ def save_session_recording_sync(
     content_type: str,
 ) -> dict[str, Any] | None:
     """Blocking wrapper for finalize() in thread pool."""
-    if not transcript_storage_mongodb():
+    if not transcript_storage_postgresql() or not object_storage_enabled():
         return None
-    import asyncio
 
     try:
         asyncio.get_running_loop()
@@ -90,7 +83,6 @@ def save_session_recording_sync(
                 content_type=content_type,
             )
         )
-    import concurrent.futures
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
         return pool.submit(

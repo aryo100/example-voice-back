@@ -8,13 +8,6 @@ numpy>=1.24.0
 webrtcvad>=2.0.10
 # Optional recording: PCM → MP3 (requires ffmpeg on system)
 pydub>=0.25.0
-# Optional: silero-vad (uncomment if preferred over webrtcvad)
-# torch>=2.0.0
-# torchaudio>=2.0.0
-
-# ASR - local (choose one or both)
-# faster-whisper>=1.0.0
-# openai-whisper  # alternative
 
 # HTTP client for remote ASR
 httpx>=0.26.0
@@ -25,5 +18,11 @@ edge-tts>=7.2.7
 # Config
 pydantic-settings>=2.1.0
 
-# Transcript storage (when TRANSCRIPT_STORAGE=mongodb or USE_DATABASE=true)
-motor>=3.3.0
+# PostgreSQL (when TRANSCRIPT_STORAGE=postgresql or USE_DATABASE=true)
+sqlalchemy[asyncio]>=2.0.25
+asyncpg>=0.29.0
+greenlet>=3.0.0
+
+# Cloud object storage for session recordings (pick one backend via OBJECT_STORAGE_BACKEND)
+supabase>=2.4.0
+firebase-admin>=6.5.0

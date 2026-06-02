@@ -2,6 +2,8 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+# ffmpeg for optional MP3 recording; gcc for webrtcvad build.
+# No database server in this image — PostgreSQL and object storage are external.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     build-essential \

@@ -25,30 +25,33 @@ pip install faster-whisper
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-### Docker (API + MongoDB)
+### Docker (API + PostgreSQL)
 
 ```bash
-# Salin .env dan isi API keys (Cloudflare, OpenRouter, dll.)
 cp .env.example .env
+# Set CLOUDFLARE_*, OPENROUTER_*, and object storage keys if using recordings + database
 
 docker compose up --build
 ```
 
-- API: http://localhost:8000
-- **Mongo Express (DB UI):** http://127.0.0.1:8081 — pilih database `voice_back` (Basic Auth off; port hanya `127.0.0.1` di Docker)
-  - Collection `transcripts` — teks dialog + field `recording` (metadata audio)
-  - Collections `recordings.files` / `recordings.chunks` — audio GridFS (saat `ENABLE_BACKEND_RECORDING=true`)
-- MongoDB: `mongodb://localhost:27017`
-- Compose sets `USE_DATABASE=true`, `MONGODB_URI=mongodb://mongodb:27017`
+- **API:** http://localhost:8000
+- **Stream test UI:** http://localhost:8080/stream_test.html (also redirects from http://localhost:8000/stream_test.html)
+- **Swagger UI:** http://localhost:8080/docs
+- **PostgreSQL:** `localhost:5432` — database `voice_back`, user/password `postgres`/`postgres` (local compose only)
+- **pgAdmin:** http://127.0.0.1:5050 — login `admin@local.dev` / `admin`, add server host `postgres`, port `5432`
+- Compose sets `USE_DATABASE=true`, `DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/voice_back`
 
-**Rekaman audio ke MongoDB:** set di `.env` `ENABLE_BACKEND_RECORDING=true` (dan `USE_DATABASE=true`). File disimpan di GridFS bucket `recordings`, metadata di dokumen `transcripts`.
+**Architecture:** transcripts and refinements live in PostgreSQL (`transcript_sessions` table). Session audio is **not** stored in the DB or container — upload to **Supabase Storage** or **Firebase Storage**; only `recording_url` is saved in PostgreSQL.
 
-Tanpa Docker: set `USE_DATABASE=true` (atau `TRANSCRIPT_STORAGE=mongodb`) dan jalankan MongoDB lokal, lalu `MONGODB_URI=mongodb://localhost:27017`.
+**Enable cloud recordings:** in `.env` set `ENABLE_BACKEND_RECORDING=true`, `OBJECT_STORAGE_BACKEND=supabase` (or `firebase`), and the matching credentials.
+
+**File-only mode (no DB):** `USE_DATABASE=false`, `TRANSCRIPT_STORAGE=file` — transcripts in `./transcripts`, optional local recordings in `./recordings`.
+
+**Deploy (Render / Hugging Face Spaces):** use a hosted PostgreSQL `DATABASE_URL` and cloud storage env vars; the Docker image contains only the Python app (no database server).
 
 - **WebSocket**: `ws://localhost:8000/ws/transcribe`
 - **Health**: `GET http://localhost:8000/health`
-- **API docs (Swagger, TypeScript)**: run the `web/` dev server — `cd web && npm install && npm run dev` → [http://localhost:8080/docs](http://localhost:8080/docs)
-- **Stream test UI**: [http://localhost:8080/stream_test.html](http://localhost:8080/stream_test.html) (same dev server; proxies `/api/*` to port 8000)
+- **API docs (Swagger)** and **stream test**: included in Docker via the `web` service on port **8080** — http://localhost:8080/docs and http://localhost:8080/stream_test.html (opening `/stream_test.html` on port 8000 redirects to 8080)
 - **Refine transcript**: `POST /api/refine-transcript` — context-aware re-transcription using chat AI (see [docs/REFINE_TRANSCRIPT.md](docs/REFINE_TRANSCRIPT.md))
 
 ## Streaming Logic: Chunking + VAD

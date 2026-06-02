@@ -17,6 +17,7 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 
 from app.config import (
     get_settings,
@@ -25,9 +26,9 @@ from app.config import (
     chat_llm_compact_context_parts,
     chat_llm_compact_knowledge,
     chat_use_only_relevant_snippet,
-    transcript_storage_mongodb,
+    transcript_storage_postgresql,
 )
-from app.db.mongo import close_mongo, connect_mongo
+from app.db.postgres import close_postgres, connect_postgres
 from app.asr.base import ASREngine
 from app.asr.local_whisper import LocalWhisperEngine
 from app.asr.cloudflare import CloudflareWhisperEngine
@@ -186,10 +187,10 @@ async def lifespan(app: FastAPI):
         app.state.whisper_model = _load_whisper_model()
     else:
         app.state.whisper_model = None
-    if transcript_storage_mongodb():
-        await connect_mongo()
+    if transcript_storage_postgresql():
+        await connect_postgres()
     yield
-    await close_mongo()
+    await close_postgres()
     app.state.whisper_model = None
     _current_app = None
 
@@ -211,6 +212,21 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "OPTIONS"],
     allow_headers=["*"],
 )
+
+
+def _web_public_base() -> str:
+    """Base URL of the web UI (stream test + Swagger). Set WEB_PUBLIC_URL in Docker."""
+    return (os.environ.get("WEB_PUBLIC_URL") or "http://localhost:8080").rstrip("/")
+
+
+@app.get("/stream_test.html", include_in_schema=False)
+async def redirect_stream_test() -> RedirectResponse:
+    return RedirectResponse(url=f"{_web_public_base()}/stream_test.html", status_code=307)
+
+
+@app.get("/docs", include_in_schema=False)
+async def redirect_api_docs() -> RedirectResponse:
+    return RedirectResponse(url=f"{_web_public_base()}/docs", status_code=307)
 
 
 @app.websocket("/ws/transcribe")
@@ -250,15 +266,22 @@ async def websocket_transcribe_with_assistant(websocket: WebSocket) -> None:
 @app.get("/health")
 async def health() -> dict:
     out: dict = {"status": "ok", "transcript_storage": get_settings().TRANSCRIPT_STORAGE}
-    if transcript_storage_mongodb():
+    if transcript_storage_postgresql():
         try:
-            from app.db.mongo import get_mongo_client
+            from sqlalchemy import text
 
-            await get_mongo_client().admin.command("ping")
-            out["mongodb"] = "ok"
+            from app.db.postgres import get_session
+
+            async with get_session() as session:
+                await session.execute(text("SELECT 1"))
+            out["postgresql"] = "ok"
         except Exception as e:
             out["status"] = "degraded"
-            out["mongodb"] = str(e)
+            out["postgresql"] = str(e)
+    settings = get_settings()
+    storage_backend = (getattr(settings, "OBJECT_STORAGE_BACKEND", "none") or "none").strip().lower()
+    if storage_backend != "none":
+        out["object_storage"] = storage_backend
     return out
 
 

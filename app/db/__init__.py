@@ -1,1 +1,1 @@
-"""Database clients (MongoDB when TRANSCRIPT_STORAGE=mongodb)."""
+"""Database clients (PostgreSQL when TRANSCRIPT_STORAGE=postgresql)."""

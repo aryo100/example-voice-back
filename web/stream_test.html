@@ -47,13 +47,13 @@
 </head>
 <body>
   <h1>Real-time Audio Streaming Test Client</h1>
-  <p style="font-size: 0.9rem; color: #64748b;">Microphone → PCM → WebSocket → transcript. Chat via /api/chat. <strong>Hindari CORS:</strong> jalankan <code>python server.py</code> di folder ini, lalu buka <code>http://localhost:8080/stream_test.html</code>. Jika halaman dari port 8080, isi <strong>API Base URL</strong> dengan backend (e.g. <code>http://localhost:8000</code>).</p>
+  <p style="font-size: 0.9rem; color: #64748b;">Microphone → PCM → WebSocket → transcript. Chat via /api/chat. Buka lewat <code>http://localhost:8080/stream_test.html</code> (Docker: service <code>web</code>, atau <code>npm run dev</code> di folder <code>web/</code>). API Base URL kosong = proxy lewat server web ini.</p>
 
   <label for="wsUrl">WebSocket URL</label>
-  <input type="text" id="wsUrl" value="ws://localhost:8000/ws/transcribe-with-assistant" placeholder="ws://localhost:8000/ws/transcribe-with-assistant" />
+  <input type="text" id="wsUrl" value="" placeholder="ws://localhost:8000/ws/transcribe-with-assistant" />
 
-  <label for="apiBaseUrl">API Base URL <span style="font-weight: normal; color: #64748b;">(untuk /api/chat, /api/session/activate; kosongkan jika halaman diload dari backend)</span></label>
-  <input type="text" id="apiBaseUrl" value="http://localhost:8000" placeholder="http://localhost:8000" />
+  <label for="apiBaseUrl">API Base URL <span style="font-weight: normal; color: #64748b;">(kosong = proxy lewat server web ini)</span></label>
+  <input type="text" id="apiBaseUrl" value="" placeholder="http://localhost:8000" />
 
   <button id="btnStart">Start recording</button>
   <button id="btnStop" disabled>Stop recording</button>
@@ -206,6 +206,25 @@
       const btnStop = $("btnStop");
       const btnDownload = $("btnDownload");
       const wsUrlInput = $("wsUrl");
+      const apiBaseUrlInput = $("apiBaseUrl");
+
+      function applyStreamTestConfig(cfg) {
+        if (!cfg) return;
+        if (cfg.wsUrl && wsUrlInput) wsUrlInput.value = cfg.wsUrl;
+        if (apiBaseUrlInput && cfg.apiBaseUrl !== undefined) apiBaseUrlInput.value = cfg.apiBaseUrl;
+      }
+
+      fetch("/config.json")
+        .then((r) => (r.ok ? r.json() : null))
+        .then(applyStreamTestConfig)
+        .catch(() => {
+          if (typeof location === "undefined" || location.protocol === "file:") return;
+          if (wsUrlInput && !wsUrlInput.value.trim()) {
+            const proto = location.protocol === "https:" ? "wss:" : "ws:";
+            wsUrlInput.value = proto + "//" + location.host + "/ws/transcribe-with-assistant";
+          }
+        });
+
       const chatMessagesEl = $("chatMessages");
       const chatInputEl = $("chatInput");
       const btnChatSend = $("btnChatSend");

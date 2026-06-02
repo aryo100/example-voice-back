@@ -56,17 +56,29 @@ class Settings(BaseSettings):
     AUDIO_RECORD_DIR: str = "./recordings"
     AUDIO_RECORD_BITRATE: str = "128k"
 
-    # Session transcript storage: file (./transcripts) or mongodb (TRANSCRIPT_STORAGE / USE_DATABASE).
+    # Session transcript storage: file (./transcripts) or postgresql (TRANSCRIPT_STORAGE / USE_DATABASE).
     USE_DATABASE: bool = False
-    TRANSCRIPT_STORAGE: Literal["file", "mongodb"] = "file"
+    TRANSCRIPT_STORAGE: Literal["file", "postgresql"] = "file"
     TRANSCRIPT_SAVE_ENABLED: bool = True
     TRANSCRIPT_DIR: str = "./transcripts"
     TRANSCRIPT_ADD_TIMESTAMPS: bool = False
-    # MongoDB (when TRANSCRIPT_STORAGE=mongodb)
-    MONGODB_URI: str = "mongodb://localhost:27017"
-    MONGODB_DATABASE: str = "voice_back"
-    MONGODB_TRANSCRIPTS_COLLECTION: str = "transcripts"
-    MONGODB_RECORDINGS_BUCKET: str = "recordings"  # GridFS bucket for session audio
+
+    # PostgreSQL (when TRANSCRIPT_STORAGE=postgresql)
+    # asyncpg driver: postgresql+asyncpg://user:pass@host:5432/dbname
+    DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/voice_back"
+
+    # Cloud object storage for session audio (URL stored in PostgreSQL only).
+    # none = local file (./recordings) when not using database; supabase | firebase for cloud.
+    OBJECT_STORAGE_BACKEND: Literal["none", "supabase", "firebase"] = "none"
+    SUPABASE_URL: str = ""
+    SUPABASE_SERVICE_ROLE_KEY: str = ""
+    SUPABASE_STORAGE_BUCKET: str = "recordings"
+    SUPABASE_STORAGE_PREFIX: str = "sessions"
+    FIREBASE_CREDENTIALS_PATH: str = ""
+    FIREBASE_CREDENTIALS_JSON: str = ""  # inline service account JSON (Render/HF Spaces)
+    FIREBASE_STORAGE_BUCKET: str = ""
+    FIREBASE_STORAGE_PREFIX: str = "sessions"
+    FIREBASE_STORAGE_MAKE_PUBLIC: bool = True
 
     # Speaker-aware transcription (diarization only; no audio separation, single channel).
     DIARIZATION_ENABLED: bool = True
@@ -154,8 +166,8 @@ class Settings(BaseSettings):
         if v is None:
             return "file"
         s = str(v).strip().lower()
-        if s in ("mongo", "mongodb", "db", "database"):
-            return "mongodb"
+        if s in ("postgres", "postgresql", "pgsql", "db", "database"):
+            return "postgresql"
         return "file"
 
     @field_validator("USE_DATABASE", mode="before")
@@ -168,7 +180,7 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def _apply_use_database(self) -> Self:
         if self.USE_DATABASE:
-            self.TRANSCRIPT_STORAGE = "mongodb"
+            self.TRANSCRIPT_STORAGE = "postgresql"
         return self
 
     class Config:
@@ -227,13 +239,19 @@ def chat_knowledge_multi_system() -> bool:
     return False
 
 
-def transcript_storage_mongodb() -> bool:
-    """True when transcripts are stored in MongoDB."""
+def transcript_storage_postgresql() -> bool:
+    """True when transcripts are stored in PostgreSQL."""
     s = get_settings()
     raw = getattr(s, "TRANSCRIPT_STORAGE", "file")
     if isinstance(raw, str):
-        return raw.strip().lower() in ("mongodb", "mongo", "db", "database")
+        return raw.strip().lower() in ("postgresql", "postgres", "pgsql", "db", "database")
     return False
+
+
+def object_storage_enabled() -> bool:
+    """True when cloud object storage is configured for recordings."""
+    backend = (getattr(get_settings(), "OBJECT_STORAGE_BACKEND", "none") or "none").strip().lower()
+    return backend in ("supabase", "firebase")
 
 
 def assistant_name_and_aliases() -> tuple[str, list[str]]:

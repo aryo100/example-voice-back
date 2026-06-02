@@ -19,6 +19,8 @@ const WEB_ROOT = path.resolve(__dirname, "..");
 
 const PORT = Number(process.env.PORT ?? 8080);
 const BACKEND = (process.env.BACKEND_URL ?? "http://localhost:8000").replace(/\/$/, "");
+/** Browser-facing backend URL (WebSocket). In Docker set to http://localhost:8000 while BACKEND_URL=http://api:8000. */
+const PUBLIC_BACKEND = (process.env.PUBLIC_BACKEND_URL ?? BACKEND).replace(/\/$/, "");
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
@@ -40,6 +42,15 @@ app.use(
 
 app.get("/", (_req, res) => {
   res.redirect("/docs");
+});
+
+/** Defaults for stream_test.html (WebSocket → backend; HTTP API via same-origin proxy). */
+app.get("/config.json", (_req, res) => {
+  const wsBase = PUBLIC_BACKEND.replace(/^http/i, (m) => (m.toLowerCase() === "https" ? "wss" : "ws"));
+  res.json({
+    apiBaseUrl: "",
+    wsUrl: `${wsBase}/ws/transcribe-with-assistant`,
+  });
 });
 
 /** Proxy API calls to Python backend (avoids CORS from static page). */
@@ -85,4 +96,7 @@ app.listen(PORT, () => {
   console.log(`  OpenAPI     http://localhost:${PORT}/openapi.json`);
   console.log(`  Stream test http://localhost:${PORT}/stream_test.html`);
   console.log(`  API proxy   -> ${BACKEND}`);
+  if (PUBLIC_BACKEND !== BACKEND) {
+    console.log(`  Public WS   -> ${PUBLIC_BACKEND}`);
+  }
 });

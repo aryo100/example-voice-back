@@ -1,32 +1,33 @@
 services:
-  mongodb:
-    image: mongo:7
+  postgres:
+    image: postgres:16-alpine
     restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: voice_back
     ports:
-      - "27017:27017"
+      - "5432:5432"
     volumes:
-      - mongo_data:/data/db
+      - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d voice_back"]
       interval: 10s
       timeout: 5s
       retries: 5
 
-  mongo-express:
-    image: mongo-express:1.0.2-20
+  pgadmin:
+    image: dpage/pgadmin4:8
     restart: unless-stopped
     ports:
-      - "127.0.0.1:8081:8081"
+      - "127.0.0.1:5050:80"
     environment:
-      # Override image default (mongodb://mongo:27017) — service name is "mongodb"
-      ME_CONFIG_MONGODB_URL: mongodb://mongodb:27017/
-      ME_CONFIG_MONGODB_ENABLE_ADMIN: "true"
-      # Port is 127.0.0.1-only; disable Basic Auth so browsers work without a login dialog
-      # (curl -u worked; plain browser showed blank "Unauthorized").
-      ME_CONFIG_BASICAUTH: "false"
-      ME_CONFIG_SITE_BASEURL: /
+      PGADMIN_DEFAULT_EMAIL: admin@local.dev
+      PGADMIN_DEFAULT_PASSWORD: admin
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
     depends_on:
-      mongodb:
+      postgres:
         condition: service_healthy
 
   api:
@@ -38,18 +39,28 @@ services:
       - .env
     environment:
       USE_DATABASE: "true"
-      TRANSCRIPT_STORAGE: mongodb
-      MONGODB_URI: mongodb://mongodb:27017
-      MONGODB_DATABASE: voice_back
-      MONGODB_TRANSCRIPTS_COLLECTION: transcripts
-      MONGODB_RECORDINGS_BUCKET: recordings
+      TRANSCRIPT_STORAGE: postgresql
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/voice_back
       ASR_BACKEND: cloudflare
+      WEB_PUBLIC_URL: http://localhost:8080
+      # Set in .env: OBJECT_STORAGE_BACKEND=supabase|firebase + credentials
     volumes:
       - ./transcripts:/app/transcripts
-      - ./recordings:/app/recordings
     depends_on:
-      mongodb:
+      postgres:
         condition: service_healthy
 
+  web:
+    build: ./web
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      BACKEND_URL: http://api:8000
+      PUBLIC_BACKEND_URL: http://localhost:8000
+    depends_on:
+      - api
+
 volumes:
-  mongo_data:
+  postgres_data:
+  pgadmin_data:

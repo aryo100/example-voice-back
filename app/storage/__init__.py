@@ -1,0 +1,1 @@
+"""Cloud object storage integrations."""
