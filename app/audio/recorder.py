@@ -17,6 +17,7 @@ import time
 import uuid
 import wave
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
@@ -35,6 +36,19 @@ RMS_SILENCE_THRESHOLD = 100
 RMS_SILENCE_CHUNKS_WARN = 50
 
 
+@dataclass(frozen=True)
+class PendingRecordingUpload:
+    """Encoded audio ready for cloud upload; persist metadata on the main asyncio loop."""
+
+    session_id: str
+    audio_bytes: bytes
+    filename: str
+    content_type: str
+
+
+FinalizeResult = Optional[str | PendingRecordingUpload]
+
+
 class AudioRecorderBase(ABC):
     """Base for session recorder. append() accepts raw PCM; finalize() writes file once and returns path or None."""
 
@@ -44,8 +58,11 @@ class AudioRecorderBase(ABC):
         ...
 
     @abstractmethod
-    def finalize(self) -> Optional[str]:
-        """Flush buffer, write file (WAV or WAV→MP3), close once. Run in executor. Returns path or None."""
+    def finalize(self) -> FinalizeResult:
+        """
+        Flush buffer. Run in executor.
+        Returns local file path, PendingRecordingUpload (cloud), or None.
+        """
         ...
 
 
@@ -55,7 +72,7 @@ class NoOpAudioRecorder(AudioRecorderBase):
     def append(self, data: bytes) -> None:
         pass
 
-    def finalize(self) -> Optional[str]:
+    def finalize(self) -> FinalizeResult:
         return None
 
 
@@ -151,7 +168,7 @@ class AudioRecorder(AudioRecorderBase):
         else:
             self._low_rms_count = 0
 
-    def finalize(self) -> Optional[str]:
+    def finalize(self) -> FinalizeResult:
         if self._finalized:
             return None
         self._finalized = True
@@ -188,10 +205,8 @@ class AudioRecorder(AudioRecorderBase):
             return mp3_path
         return wav_path
 
-    def _finalize_to_cloud_storage(self, pcm: bytes, base: str) -> Optional[str]:
-        """Encode WAV/MP3, upload to Supabase/Firebase; URL saved in PostgreSQL."""
-        from app.db.recordings_storage import save_session_recording_sync
-
+    def _finalize_to_cloud_storage(self, pcm: bytes, base: str) -> PendingRecordingUpload:
+        """Encode WAV/MP3 in executor; upload + DB metadata happen on the main event loop."""
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_wav:
             wav_tmp = tmp_wav.name
         try:
@@ -216,15 +231,12 @@ class AudioRecorder(AudioRecorderBase):
             except OSError:
                 pass
 
-        meta = save_session_recording_sync(
-            self._session_id,
-            audio_bytes,
+        return PendingRecordingUpload(
+            session_id=self._session_id,
+            audio_bytes=audio_bytes,
             filename=filename,
             content_type=content_type,
         )
-        if meta:
-            return meta.get("url")
-        return None
 
 
 def create_audio_recorder(session_id: str | None = None) -> AudioRecorderBase:

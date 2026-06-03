@@ -26,6 +26,7 @@ from app.audio import (
     AudioChunker,
     AudioRecorderBase,
     AudioReceiver,
+    PendingRecordingUpload,
     RollingBuffer,
     VADProcessor,
     create_audio_recorder,
@@ -476,7 +477,24 @@ class WebSocketManager:
                 transcript_finalized=True,
             )
             loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, self._recorder.finalize)
+            finalize_result = await loop.run_in_executor(None, self._recorder.finalize)
+            if isinstance(finalize_result, PendingRecordingUpload):
+                from app.db.recordings_storage import save_session_recording
+
+                try:
+                    await save_session_recording(
+                        finalize_result.session_id,
+                        finalize_result.audio_bytes,
+                        filename=finalize_result.filename,
+                        content_type=finalize_result.content_type,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Cloud recording upload/metadata failed for session %s: %s",
+                        finalize_result.session_id,
+                        e,
+                        exc_info=True,
+                    )
 
 
 # --- Subclass untuk route dengan assistant reply via WS ---

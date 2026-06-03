@@ -3,7 +3,7 @@ from .receiver import AudioReceiver
 from .vad import VADProcessor
 from .chunker import AudioChunker
 from .rolling_buffer import RollingBuffer
-from .recorder import AudioRecorderBase, create_audio_recorder
+from .recorder import AudioRecorderBase, PendingRecordingUpload, create_audio_recorder
 
 __all__ = [
     "AudioReceiver",
@@ -11,5 +11,6 @@ __all__ = [
     "AudioChunker",
     "RollingBuffer",
     "AudioRecorderBase",
+    "PendingRecordingUpload",
     "create_audio_recorder",
 ]

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import logging
 from typing import Any
 
@@ -22,7 +21,8 @@ async def save_session_recording(
 ) -> dict[str, Any]:
     """
     Upload audio to Supabase/Firebase Storage and save the URL in PostgreSQL.
-    Returns {url, filename, content_type, size}.
+    Must run on the FastAPI event loop (not from a thread pool).
+    Returns {url, filename, content_type, size, object_path}.
     """
     if not transcript_storage_postgresql():
         raise RuntimeError("PostgreSQL transcript storage is not enabled")
@@ -59,38 +59,3 @@ async def save_session_recording(
         len(audio_bytes),
     )
     return meta
-
-
-def save_session_recording_sync(
-    session_id: str,
-    audio_bytes: bytes,
-    *,
-    filename: str,
-    content_type: str,
-) -> dict[str, Any] | None:
-    """Blocking wrapper for finalize() in thread pool."""
-    if not transcript_storage_postgresql() or not object_storage_enabled():
-        return None
-
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(
-            save_session_recording(
-                session_id,
-                audio_bytes,
-                filename=filename,
-                content_type=content_type,
-            )
-        )
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(
-            asyncio.run,
-            save_session_recording(
-                session_id,
-                audio_bytes,
-                filename=filename,
-                content_type=content_type,
-            ),
-        ).result(timeout=120)
