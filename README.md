@@ -1,6 +1,6 @@
 # Real-Time Speech-to-Text Backend
 
-Python 3.11 backend for **real-time speech-to-text** over WebSocket. Accepts continuous PCM audio, runs VAD and chunking with overlap, and returns partial and final transcripts via a swappable Whisper-compatible ASR engine.
+Python 3.10+ backend for **real-time speech-to-text** over WebSocket. Accepts continuous PCM audio, runs VAD and chunking with overlap, and returns partial and final transcripts via a swappable Whisper-compatible ASR engine.
 
 ## Stack
 
@@ -136,7 +136,10 @@ Server → Client (JSON): partial then final { type, text, confidence, timestamp
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ASR_BACKEND` | `local` | `local` or `cloudflare` |
+| `ASR_BACKEND` | `local` | `local`, `cloudflare`, or `coqui` |
+| `COQUI_STT_LANG` | `auto` | `auto` (Whisper detect, Indo+EN mix), `id`, or `en` (Coqui only) |
+| `COQUI_AUTO_WHISPER_MODEL` | `small` | Whisper size when `COQUI_STT_LANG=auto` |
+| `COQUI_MODEL_DIR` | `./coqui_stt_models` | Download dir for Coqui TFLite models |
 | `SAMPLE_RATE` | 16000 | PCM sample rate |
 | `FRAME_MS` | 20 | Frame duration (ms) |
 | `CHUNK_DURATION_MS` | 1500 | Chunk length before overlap |
@@ -169,7 +172,8 @@ app/
 ├── asr/
 │   ├── base.py          # ASREngine abstract, TranscriptResult
 │   ├── local_whisper.py # LocalWhisperEngine (faster-whisper)
-│   └── cloudflare.py    # CloudflareWhisperEngine (Workers AI)
+│   ├── cloudflare.py    # CloudflareWhisperEngine (Workers AI)
+│   └── coqui.py         # CoquiSTTEngine (coqui-stt, id/en)
 └── transcript/
     └── merger.py        # TranscriptMerger: partial vs final messages
 

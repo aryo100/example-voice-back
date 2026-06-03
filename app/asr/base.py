@@ -1,7 +1,7 @@
 """
 ASREngine: abstract interface for Whisper-compatible ASR.
 
-Implementations: LocalWhisperEngine (faster-whisper), CloudflareWhisperEngine.
+Implementations: LocalWhisperEngine (faster-whisper), CloudflareWhisperEngine, CoquiSTTEngine.
 All run heavy work in executor to avoid blocking the event loop.
 """
 from __future__ import annotations

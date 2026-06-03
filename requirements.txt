@@ -3,14 +3,17 @@ fastapi>=0.109.0
 uvicorn[standard]>=0.27.0
 websockets>=12.0
 
-# Audio / VAD
-numpy>=1.24.0
+# Audio / VAD (numpy<2 required by coqui stt bindings)
+numpy>=1.24.0,<2.0.0
 webrtcvad>=2.0.10
 # Optional recording: PCM → MP3 (requires ffmpeg on system)
 pydub>=0.25.0
 
 # ASR local (when ASR_BACKEND=local) — faster-whisper + ctranslate2
 faster-whisper>=1.0.0
+
+# Coqui STT (when ASR_BACKEND=coqui) — PyPI package `stt`, Python 3.10 Linux
+stt==1.4.0
 
 # HTTP client for remote ASR (Cloudflare)
 httpx>=0.26.0
@@ -20,6 +23,7 @@ edge-tts>=7.2.7
 
 # Config
 pydantic-settings>=2.1.0
+typing_extensions>=4.0.0
 
 # PostgreSQL (when TRANSCRIPT_STORAGE=postgresql or USE_DATABASE=true)
 sqlalchemy[asyncio]>=2.0.25

@@ -39,6 +39,7 @@ Thumbs.db
 # Project: local recordings & transcripts (optional; remove line to track)
 recordings/
 transcripts/
+coqui_stt_models/
 assets/
 
 # Testing / coverage

@@ -32,6 +32,12 @@ from app.db.postgres import close_postgres, connect_postgres
 from app.asr.base import ASREngine
 from app.asr.local_whisper import LocalWhisperEngine
 from app.asr.cloudflare import CloudflareWhisperEngine
+from app.asr.coqui import (
+    CoquiSTTEngine,
+    is_coqui_auto_mode,
+    load_coqui_auto_whisper,
+    load_coqui_model,
+)
 from app.websocket_manager import WebSocketManager, WebSocketManagerWithAssistant
 from app.schemas.refine import RefineRequest, RefineResponse
 from app.schemas.chat import ActivateSessionRequest, ActivateSessionResponse, ChatRequest, ChatResponse
@@ -155,6 +161,11 @@ def get_asr_engine(app: FastAPI | None = None) -> ASREngine:
     settings = get_settings()
     if settings.ASR_BACKEND == "cloudflare":
         return CloudflareWhisperEngine()
+    if settings.ASR_BACKEND == "coqui":
+        return CoquiSTTEngine(
+            model=getattr(a.state, "coqui_model", None),
+            whisper_model=getattr(a.state, "coqui_whisper_model", None),
+        )
     model = getattr(a.state, "whisper_model", None)
     return LocalWhisperEngine(model=model)
 
@@ -185,13 +196,27 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
     if settings.ASR_BACKEND == "local":
         app.state.whisper_model = _load_whisper_model()
+        app.state.coqui_model = None
+        app.state.coqui_whisper_model = None
+    elif settings.ASR_BACKEND == "coqui":
+        app.state.whisper_model = None
+        if is_coqui_auto_mode():
+            app.state.coqui_whisper_model = load_coqui_auto_whisper()
+            app.state.coqui_model = None
+        else:
+            app.state.coqui_whisper_model = None
+            app.state.coqui_model = load_coqui_model()
     else:
         app.state.whisper_model = None
+        app.state.coqui_model = None
+        app.state.coqui_whisper_model = None
     if transcript_storage_postgresql():
         await connect_postgres()
     yield
     await close_postgres()
     app.state.whisper_model = None
+    app.state.coqui_model = None
+    app.state.coqui_whisper_model = None
     _current_app = None
 
 

@@ -1,7 +1,12 @@
 """Application configuration. Loads from env vars."""
 from pydantic_settings import BaseSettings
 from pydantic import field_validator, model_validator
-from typing import Literal, Self
+from typing import Literal
+
+try:
+    from typing import Self
+except ImportError:
+    from typing_extensions import Self
 
 
 class Settings(BaseSettings):
@@ -28,12 +33,18 @@ class Settings(BaseSettings):
     STT_MIN_CHUNK_SECONDS: float = 0.5  # do not transcribe chunks < 500ms (prevent hallucination)
     STT_COMMIT_AGE_SECONDS: float = 2.0  # commit horizon: segments ending before (current_audio_time - this) → FINAL
 
-    # ASR backend: "local" | "cloudflare"
-    ASR_BACKEND: Literal["local", "cloudflare"] = "local"
+    # ASR backend: "local" | "cloudflare" | "coqui"
+    ASR_BACKEND: Literal["local", "cloudflare", "coqui"] = "local"
 
     # Cloudflare Workers AI: ASR (when ASR_BACKEND=cloudflare) and refine-transcript (LLM)
     CLOUDFLARE_ACCOUNT_ID: str = ""
     CLOUDFLARE_API_TOKEN: str = ""
+
+    # Coqui STT (when ASR_BACKEND=coqui) — id | en | auto
+    # auto = faster-whisper language=None (Indonesian + English in one session)
+    COQUI_STT_LANG: Literal["id", "en", "auto"] = "auto"
+    COQUI_MODEL_DIR: str = "./coqui_stt_models"
+    COQUI_AUTO_WHISPER_MODEL: str = "small"  # tiny | base | small | medium | large-v3
 
     # Local Whisper (when ASR_BACKEND=local) — model loaded once at startup
     LOCAL_WHISPER_MODEL: str = "base"  # base | small | medium | large-v3
