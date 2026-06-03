@@ -41,7 +41,7 @@ services:
       USE_DATABASE: "true"
       TRANSCRIPT_STORAGE: postgresql
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/voice_back
-      ASR_BACKEND: cloudflare
+      ASR_BACKEND: local
       WEB_PUBLIC_URL: http://localhost:8080
       # Set in .env: OBJECT_STORAGE_BACKEND=supabase|firebase + credentials
     volumes:
